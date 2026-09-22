@@ -1,7 +1,10 @@
 """Unit tests for GitHub URL parsing and extraction (SPEC2-CLI Section 3.3)."""
 
 import io
+import os
+import shutil
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -10,8 +13,24 @@ from skillport.modules.skills.internal.github import (
     GITHUB_URL_RE,
     ParsedGitHubURL,
     extract_tarball,
+    get_remote_tree_symlinks,
     parse_github_url,
 )
+
+
+def _symlink_capable() -> bool:
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink("target", Path(tmp) / "probe")
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+@pytest.fixture
+def require_symlink():
+    if not _symlink_capable():
+        pytest.skip("symlinks cannot be created on this platform")
 
 
 def _make_tar(tmp_path: Path, structure: dict) -> Path:
@@ -144,7 +163,12 @@ class TestGitHubURLRegex:
             ),
             (
                 "https://github.com/owner/repo/blob/main/skills/.experimental/create-plan",
-                {"owner": "owner", "repo": "repo", "ref": "main", "path": "/skills/.experimental/create-plan"},
+                {
+                    "owner": "owner",
+                    "repo": "repo",
+                    "ref": "main",
+                    "path": "/skills/.experimental/create-plan",
+                },
             ),
             # Special characters in owner/repo
             (
@@ -211,22 +235,33 @@ class TestExtractTarball:
             tar.addfile(info)
 
         parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
-        with pytest.raises(ValueError, match="[Ss]ymlink"):
+        with pytest.raises(ValueError, match="Symlinks are not allowed in GitHub source"):
             extract_tarball(tar_path, parsed)
 
-    def test_extract_rejects_hardlink(self, tmp_path):
-        """Hardlinks in tarball → rejected."""
+    def test_extract_rejects_hardlink(self, tmp_path, monkeypatch):
+        """Hardlinks in tarball → rejected with the historical symlink error."""
+        extracted = tmp_path / "extracted"
+        monkeypatch.setattr(
+            "skillport.modules.skills.internal.github.tempfile.mkdtemp",
+            lambda **_kwargs: str(extracted),
+        )
         tar_path = tmp_path / "repo.tar.gz"
         root = "owner-repo-sha"
         with tarfile.open(tar_path, "w:gz") as tar:
+            data = b"body"
+            skill = tarfile.TarInfo(f"{root}/skills/a/SKILL.md")
+            skill.size = len(data)
+            tar.addfile(skill, io.BytesIO(data))
             info = tarfile.TarInfo(f"{root}/skills/hardlink")
             info.type = tarfile.LNKTYPE
             info.linkname = "target"
             tar.addfile(info)
 
         parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
-        with pytest.raises(ValueError, match="[Ss]ymlink"):
+        with pytest.raises(ValueError, match="Symlinks are not allowed in GitHub source"):
             extract_tarball(tar_path, parsed)
+
+        assert not extracted.exists()
 
     def test_extract_excludes_dotfiles(self, tmp_path):
         """Dotfiles/dirs excluded from extraction."""
@@ -243,6 +278,19 @@ class TestExtractTarball:
         assert (dest / "a" / "SKILL.md").exists()
         assert not (dest / "a" / ".hidden").exists()
         assert not (dest / ".git").exists()
+
+    def test_extract_rejects_hidden_symlink(self, tmp_path):
+        tar_path = tmp_path / "repo.tar.gz"
+        root = "owner-repo-sha"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            info = tarfile.TarInfo(f"{root}/skills/.hidden-link")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "target"
+            tar.addfile(info)
+
+        parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+        with pytest.raises(ValueError, match="[Ss]ymlink"):
+            extract_tarball(tar_path, parsed)
 
     def test_extract_root_path(self, tmp_path):
         """Extract from repository root."""
@@ -280,6 +328,184 @@ class TestExtractTarball:
 
         with pytest.raises(ValueError, match="Path traversal"):
             extract_tarball(tar_path, parsed)
+
+
+class TestExtractTarballAllowSymlinks:
+    """allow_symlinks=True: issym members are materialized, islnk stays rejected."""
+
+    def _make_symlink_tar(self, tmp_path: Path, link_target: str = "SKILL.md") -> Path:
+        tar_path = tmp_path / "repo.tar.gz"
+        root = "owner-repo-sha"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            data = b"---\nname: a\ndescription: A\n---\nbody"
+            info = tarfile.TarInfo(f"{root}/skills/a/SKILL.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+            link = tarfile.TarInfo(f"{root}/skills/a/link.md")
+            link.type = tarfile.SYMTYPE
+            link.linkname = link_target
+            tar.addfile(link)
+        return tar_path
+
+    def test_sym_member_materialized_with_flag(self, tmp_path, require_symlink):
+        """issym member is extracted as a real symlink when allowed."""
+        tar_path = self._make_symlink_tar(tmp_path)
+        parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+
+        dest, _commit_sha = extract_tarball(tar_path, parsed, allow_symlinks=True)
+
+        link = dest / "a" / "link.md"
+        assert link.is_symlink()
+        assert os.readlink(link) == "SKILL.md"
+        assert link.resolve() == (dest / "a" / "SKILL.md").resolve()
+        shutil.rmtree(dest, ignore_errors=True)
+
+    def test_hidden_and_excluded_sym_members_materialized_with_flag(
+        self, tmp_path, require_symlink
+    ):
+        """Hidden/excluded link members are materialized so per-skill validation sees them."""
+        tar_path = tmp_path / "repo.tar.gz"
+        root = "owner-repo-sha"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            data = b"---\nname: a\ndescription: A\n---\nbody"
+            skill = tarfile.TarInfo(f"{root}/skills/a/SKILL.md")
+            skill.size = len(data)
+            tar.addfile(skill, io.BytesIO(data))
+            for name in (".hidden-link", "node_modules/link"):
+                link = tarfile.TarInfo(f"{root}/skills/a/{name}")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "SKILL.md"
+                tar.addfile(link)
+            hidden_regular = tarfile.TarInfo(f"{root}/skills/a/.hidden")
+            hidden_data = b"hidden content"
+            hidden_regular.size = len(hidden_data)
+            tar.addfile(hidden_regular, io.BytesIO(hidden_data))
+
+        parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+
+        dest, _commit_sha = extract_tarball(tar_path, parsed, allow_symlinks=True)
+        try:
+            assert (dest / "a" / ".hidden-link").is_symlink()
+            assert (dest / "a" / "node_modules" / "link").is_symlink()
+            assert not (dest / "a" / ".hidden").exists()
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
+    def test_empty_symlink_target_is_rejected_before_add(
+        self, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        from skillport.modules.skills.internal import add_local, detect_skills
+        from skillport.modules.skills.internal import manager as manager_module
+        from skillport.shared.config import Config
+
+        tar_path = self._make_symlink_tar(tmp_path)
+        parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+        dest, _commit_sha = extract_tarball(tar_path, parsed, allow_symlinks=True)
+        try:
+            real_readlink = manager_module.os.readlink
+
+            def readlink(path):
+                if any(part.startswith("skillport-snapshot-") for part in Path(path).parts):
+                    return ""
+                return real_readlink(path)
+
+            monkeypatch.setattr(manager_module.os, "readlink", readlink)
+            target = tmp_path / "target"
+            results = add_local(
+                source_path=dest,
+                skills=detect_skills(dest),
+                config=Config(skills_dir=target),
+                keep_structure=False,
+                force=False,
+                allow_symlinks=True,
+            )
+
+            assert len(results) == 1
+            assert results[0].success is False
+            assert not (target / "a").exists()
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
+    def test_hardlink_rejected_even_with_flag(self, tmp_path, monkeypatch):
+        """islnk member is rejected with the hardlink error even when symlinks are allowed."""
+        extracted = tmp_path / "extracted"
+        monkeypatch.setattr(
+            "skillport.modules.skills.internal.github.tempfile.mkdtemp",
+            lambda **_kwargs: str(extracted),
+        )
+        tar_path = tmp_path / "repo.tar.gz"
+        root = "owner-repo-sha"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            data = b"body"
+            skill = tarfile.TarInfo(f"{root}/skills/a/SKILL.md")
+            skill.size = len(data)
+            tar.addfile(skill, io.BytesIO(data))
+            info = tarfile.TarInfo(f"{root}/skills/hardlink")
+            info.type = tarfile.LNKTYPE
+            info.linkname = "target"
+            tar.addfile(info)
+
+        parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+        with pytest.raises(ValueError, match="Hard links are not allowed in GitHub source"):
+            extract_tarball(tar_path, parsed, allow_symlinks=True)
+
+        assert not extracted.exists()
+
+    def test_duplicate_normalized_path_does_not_overwrite_other_entry(
+        self, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        extracted = tmp_path / "extracted"
+        monkeypatch.setattr(
+            "skillport.modules.skills.internal.github.tempfile.mkdtemp",
+            lambda **_kwargs: str(extracted),
+        )
+
+        tar_path = tmp_path / "duplicate.tar.gz"
+        root = "owner-repo-sha"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            link = tarfile.TarInfo(f"{root}/skills/a/link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../b/target"
+            tar.addfile(link)
+
+            target = tarfile.TarInfo(f"{root}/skills/b/target")
+            target_data = b"original"
+            target.size = len(target_data)
+            tar.addfile(target, io.BytesIO(target_data))
+
+            duplicate = tarfile.TarInfo(f"{root}/skills/a/./link")
+            duplicate_data = b"attacker"
+            duplicate.size = len(duplicate_data)
+            tar.addfile(duplicate, io.BytesIO(duplicate_data))
+
+        parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+        with pytest.raises(ValueError, match="(?i)duplicate tar entry"):
+            extract_tarball(tar_path, parsed, allow_symlinks=True)
+
+        assert not extracted.exists()
+
+
+def test_remote_tree_symlinks_include_hidden_and_excluded(monkeypatch):
+    from skillport.modules.skills.internal import github as github_module
+
+    monkeypatch.setattr(
+        github_module,
+        "_fetch_tree",
+        lambda parsed, token: {
+            "tree": [
+                {"type": "blob", "mode": "120000", "path": "skills/.hidden/link"},
+                {"type": "blob", "mode": "120000", "path": "skills/node_modules/link"},
+                {"type": "blob", "mode": "100644", "path": "skills/regular.txt"},
+            ]
+        },
+    )
+
+    parsed = ParsedGitHubURL(owner="user", repo="repo", ref="main", path="/skills")
+
+    assert get_remote_tree_symlinks(parsed, None, "") == [
+        ".hidden/link",
+        "node_modules/link",
+    ]
 
 
 # Backward compatibility - keep original test function names

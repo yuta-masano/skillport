@@ -180,7 +180,13 @@ skillport add <source> [options]
 | `--keep-structure/--no-keep-structure` | Preserve directory structure as namespace | Interactive |
 | `--namespace`, `-n` | Custom namespace | source directory name |
 | `--name` | Override skill name (single skill only) | from SKILL.md |
+| `--allow-symlinks` | Allow compliant relative symlinks in the source (dangerous operation; only links that stay inside the individual skill are kept) | `false` |
 | `--json` | Output as JSON (for scripting/AI agents) | `false` |
+
+> **`--allow-symlinks` is not persisted.** The flag applies to the current command
+> invocation only. It is never written to the config file or to origin metadata,
+> so every `add`/`update` re-decides and a flagless `update` rejects symlinked
+> sources again.
 
 #### Interactive Mode
 
@@ -322,7 +328,13 @@ skillport update [skill-id] [options]
 | `--force`, `-f` | Overwrite local modifications | `false` |
 | `--dry-run`, `-n` | Show what would be updated without making changes | `false` |
 | `--check`, `-c` | Check for available updates without updating | `false` |
+| `--allow-symlinks` | Update skills containing compliant relative symlinks (dangerous operation) | `false` |
 | `--json` | Output as JSON (for scripting/AI agents) | `false` |
+
+> **`--allow-symlinks` is not persisted.** Like `skillport add`, the flag is
+> valid for the current invocation only. Without it, updating a skill whose
+> source (or installed tree) contains symlinks fails and leaves the installed
+> skill unchanged.
 
 #### Default Behavior
 

@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import sys
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,20 @@ def _save(config: Config, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def capture_origin_state(*, config: Config) -> tuple[bool, dict[str, Any]]:
+    path = _path_for_config(config)
+    return path.exists(), deepcopy(_load(config))
+
+
+def restore_origin_state(state: tuple[bool, dict[str, Any]], *, config: Config) -> None:
+    file_existed, data = state
+    path = _path_for_config(config)
+    if not file_existed:
+        path.unlink(missing_ok=True)
+        return
+    _save(config, deepcopy(data))
 
 
 def record_origin(skill_id: str, payload: dict[str, Any], *, config: Config) -> None:
@@ -172,6 +188,22 @@ def compute_content_hash_with_reason(skill_path: Path) -> tuple[str, str | None]
     # Sort by posix-style relative path to match GitHub tree API ordering on all OSes
     # (Windows backslashes would otherwise produce different hashes)
     for p in sorted(skill_path.rglob("*"), key=lambda p: p.relative_to(skill_path).as_posix()):
+        if p.is_symlink():
+            # Hash the link target string itself (Git blob semantics, matches
+            # GitHub tree API mode 120000 blob SHAs); never follow the link
+            rel = p.relative_to(skill_path)
+            parts = rel.parts
+            if any(part.startswith(".") for part in parts):
+                continue
+            if any(part in ("__pycache__", ".git") for part in parts):
+                continue
+            total_bytes += p.lstat().st_size
+            files.append(p)
+            if len(files) > MAX_HASH_FILES:
+                return "", "too_many_files"
+            if total_bytes > MAX_HASH_BYTES:
+                return "", "too_large"
+            continue
         if not p.is_file():
             continue
         rel = p.relative_to(skill_path)
@@ -197,10 +229,16 @@ def compute_content_hash_with_reason(skill_path: Path) -> tuple[str, str | None]
 
     for p in files:
         rel = p.relative_to(skill_path)
-        try:
-            data = p.read_bytes()
-        except OSError:
-            return "", "unreadable"
+        if p.is_symlink():
+            try:
+                data = os.fsencode(os.readlink(p))
+            except OSError:
+                return "", "unreadable"
+        else:
+            try:
+                data = p.read_bytes()
+            except OSError:
+                return "", "unreadable"
         # Use Git blob format: sha1("blob " + length + "\0" + contents)
         # This matches the SHA returned by GitHub's tree API
         blob_header = f"blob {len(data)}\x00".encode()

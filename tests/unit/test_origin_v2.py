@@ -1,5 +1,12 @@
 """Unit tests for origin.json v2 functionality."""
 
+import hashlib
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+
 from skillport.modules.skills.internal import (
     compute_content_hash,
     get_all_origins,
@@ -10,6 +17,28 @@ from skillport.modules.skills.internal import (
     update_origin,
 )
 from skillport.shared.config import Config
+
+
+def _git_blob_sha(data: bytes) -> str:
+    """Git blob object SHA-1: sha1(b\"blob <len>\\0\" + data)."""
+    return hashlib.sha1(f"blob {len(data)}\x00".encode() + data).hexdigest()
+
+
+def _symlink_capable() -> bool:
+    """Probe whether this platform can create symlinks (skip policy of order.md)."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink("target", Path(tmp) / "probe")
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+@pytest.fixture
+def require_symlink():
+    """Skip the target test (instead of failing setup) when symlinks cannot be created."""
+    if not _symlink_capable():
+        pytest.skip("symlinks cannot be created on this platform")
 
 
 class TestMigrateOriginV2:
@@ -156,6 +185,48 @@ class TestComputeContentHash:
         (skill2 / "SKILL.md").write_text("content B")
 
         assert compute_content_hash(skill1) != compute_content_hash(skill2)
+
+
+class TestComputeContentHashSymlinks:
+    """Symlink entries are hashed with Git blob semantics over the link string."""
+
+    def test_symlink_hashed_as_blob_of_link_string(self, tmp_path, require_symlink):
+        """Symlink contributes blob_sha(link string), not the target file content."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("body\n")
+        (skill_dir / "target.txt").write_text("target-content\n")
+        os.symlink("target.txt", skill_dir / "link")
+
+        entries = [
+            ("SKILL.md", b"body\n"),
+            ("link", b"target.txt"),
+            ("target.txt", b"target-content\n"),
+        ]
+        hasher = hashlib.sha256()
+        for rel, data in sorted(entries, key=lambda e: e[0]):
+            hasher.update(rel.encode("utf-8"))
+            hasher.update(b"\x00")
+            hasher.update(_git_blob_sha(data).encode("utf-8"))
+            hasher.update(b"\x00")
+
+        assert compute_content_hash(skill_dir) == f"sha256:{hasher.hexdigest()}"
+
+    def test_symlink_hash_equals_regular_file_with_link_string(self, tmp_path, require_symlink):
+        """A symlink and a regular file containing the link string hash identically."""
+        with_link = tmp_path / "with-link"
+        with_link.mkdir()
+        (with_link / "SKILL.md").write_text("body\n")
+        (with_link / "target.txt").write_text("target-content\n")
+        os.symlink("target.txt", with_link / "link")
+
+        with_regular = tmp_path / "with-regular"
+        with_regular.mkdir()
+        (with_regular / "SKILL.md").write_text("body\n")
+        (with_regular / "target.txt").write_text("target-content\n")
+        (with_regular / "link").write_text("target.txt")
+
+        assert compute_content_hash(with_link) == compute_content_hash(with_regular)
 
 
 class TestGetOrigin:

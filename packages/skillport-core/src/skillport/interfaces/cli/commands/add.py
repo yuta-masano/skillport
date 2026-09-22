@@ -1,13 +1,14 @@
 """Add skills command."""
 
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import typer
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 
 from skillport.modules.skills.internal import (
+    acquire_local_source_snapshot,
     detect_skills,
     extract_zip,
     fetch_github_source_with_info,
@@ -16,7 +17,11 @@ from skillport.modules.skills.internal import (
     parse_github_shorthand,
     parse_github_url,
 )
-from skillport.modules.skills.public.add import add_skill
+from skillport.modules.skills.public.add import (
+    _drop_hidden_or_excluded_symlink_candidates,
+    add_skill,
+)
+from skillport.shared.utils import find_symlink_path_component, safe_basename
 
 from ..context import get_config
 from ..theme import (
@@ -33,8 +38,12 @@ def _is_github_shorthand_source(source: str) -> bool:
     """Check if source is GitHub shorthand (owner/repo) and not a local path."""
     if not is_github_shorthand(source):
         return False
-    # Local path takes priority over GitHub shorthand
-    candidate = Path(source).expanduser().resolve()
+    # Local path takes priority over GitHub shorthand. A symlinked final
+    # component or ancestor is not treated as a local source here; the add
+    # source boundary rejects it.
+    candidate = Path(source).expanduser()
+    if find_symlink_path_component(candidate):
+        return False
     return not candidate.exists()
 
 
@@ -72,13 +81,38 @@ def _get_default_namespace(source: str) -> str:
     shorthand = parse_github_shorthand(source)
     if shorthand:
         return shorthand[1]  # repo name
-    return Path(source.rstrip("/")).name
+    # Local path: normalize, so a trailing ".." never becomes the namespace.
+    return safe_basename(source)
 
 
 class UserSkipped(Exception):
     """Raised when user chooses to skip."""
 
     pass
+
+
+def _resolve_github_path(extraction_root: Path, raw_path: str) -> Path:
+    normalized = raw_path.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or any(part == ".." or ":" in part for part in path.parts):
+        raise ValueError(f"Invalid GitHub path: {raw_path}")
+
+    parts = tuple(part for part in path.parts if part not in ("", "."))
+    current = extraction_root
+    if extraction_root.is_symlink():
+        raise ValueError(f"GitHub extraction root is a symlink: {extraction_root}")
+
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"GitHub path contains a symlink component: {raw_path}")
+
+    try:
+        if not current.resolve(strict=False).is_relative_to(extraction_root.resolve()):
+            raise ValueError(f"GitHub path escapes extraction root: {raw_path}")
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"GitHub path cannot be resolved: {raw_path}") from exc
+    return current
 
 
 def _prompt_namespace_selection(
@@ -211,6 +245,7 @@ def _add_from_github_paths(
     yes: bool,
     keep_structure: bool | None,
     namespace: str | None,
+    allow_symlinks: bool = False,
 ) -> "AddResult":  # noqa: F821
     """Add skills from GitHub shorthand with multiple paths.
 
@@ -242,7 +277,7 @@ def _add_from_github_paths(
             transient=True,
         ) as progress:
             progress.add_task(f"Fetching {base_url}...", total=None)
-            fetch_result = fetch_github_source_with_info(base_url)
+            fetch_result = fetch_github_source_with_info(base_url, allow_symlinks=allow_symlinks)
             temp_dir = fetch_result.extracted_path
             commit_sha = fetch_result.commit_sha
 
@@ -254,16 +289,20 @@ def _add_from_github_paths(
         invalid_paths: list[tuple[str, str]] = []
 
         for path in paths:
+            try:
+                path_dir = _resolve_github_path(temp_dir, path)
+            except ValueError as exc:
+                invalid_paths.append((path, str(exc)))
+                continue
             path = path.strip("/")
             path_url = f"https://github.com/{owner}/{repo}/tree/{default_branch}/{path}"
-            path_dir = temp_dir / path
 
             if not path_dir.exists():
                 invalid_paths.append((path, f"Path not found in repository: {path}"))
                 continue
 
             path_infos.append((path, path_url, path_dir))
-            skills = detect_skills(path_dir)
+            skills = detect_skills(path_dir, allow_symlinks=allow_symlinks)
             all_skill_names.extend([s.name for s in skills])
 
         # Phase 3: Interactive prompt (raises UserSkipped if user skips)
@@ -295,6 +334,8 @@ def _add_from_github_paths(
                 namespace=namespace,
                 pre_fetched_dir=path_dir,
                 pre_fetched_commit_sha=commit_sha,
+                allow_symlinks=allow_symlinks,
+                cleanup_pre_fetched_dir=False,
             )
             all_added.extend(result.added)
             all_skipped.extend(result.skipped)
@@ -316,7 +357,9 @@ def _add_from_github_paths(
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _detect_skills_from_source(source: str) -> tuple[list[str], str, Path | None, str]:
+def _detect_skills_from_source(
+    source: str, *, allow_symlinks: bool = False
+) -> tuple[list[str], str, Path | None, str]:
     """Detect skills from source. Returns (skill_names, source_name, temp_dir, commit_sha)."""
     source_name = _get_source_name(source)
     temp_dir: Path | None = None
@@ -332,11 +375,11 @@ def _detect_skills_from_source(source: str) -> tuple[list[str], str, Path | None
                 transient=True,
             ) as progress:
                 progress.add_task(f"Fetching {source}...", total=None)
-                fetch_result = fetch_github_source_with_info(source)
+                fetch_result = fetch_github_source_with_info(source, allow_symlinks=allow_symlinks)
                 temp_dir = fetch_result.extracted_path
                 commit_sha = fetch_result.commit_sha
 
-            skills = detect_skills(Path(temp_dir))
+            skills = detect_skills(Path(temp_dir), allow_symlinks=allow_symlinks)
             skill_names = [s.name for s in skills] if skills else [source_name]
             return skill_names, source_name, temp_dir, commit_sha
         except Exception as e:
@@ -345,29 +388,35 @@ def _detect_skills_from_source(source: str) -> tuple[list[str], str, Path | None
             print_warning(f"Could not fetch source: {e}")
             return [source_name], source_name, None, ""
 
-    source_path = Path(source).expanduser().resolve()
+    source_path = Path(source).expanduser().absolute()
 
     # Handle zip files
-    if source_path.exists() and source_path.is_file() and source_path.suffix.lower() == ".zip":
+    if source_path.suffix.lower() == ".zip":
         try:
-            extract_result = extract_zip(source_path)
+            extract_result = extract_zip(source_path, allow_symlinks=allow_symlinks)
             temp_dir = extract_result.extracted_path
-            skills = detect_skills(temp_dir)
+            skills = detect_skills(temp_dir, allow_symlinks=allow_symlinks)
+            if allow_symlinks:
+                skills = _drop_hidden_or_excluded_symlink_candidates(temp_dir, skills)
             skill_names = [s.name for s in skills] if skills else [source_name]
             return skill_names, source_name, temp_dir, ""
         except Exception as e:
             print_warning(f"Could not extract zip: {e}")
             return [source_name], source_name, None, ""
 
-    if source_path.exists() and source_path.is_dir():
-        try:
-            skills = detect_skills(source_path)
-            skill_names = [s.name for s in skills] if skills else [source_name]
-            return skill_names, source_name, None, ""
-        except Exception:
-            return [source_name], source_name, None, ""
-
-    return [source_name], source_name, None, ""
+    try:
+        # Pre-detection reads the pinned source snapshot; the add source
+        # boundary rejects a symlinked path instead of following it.
+        stable = acquire_local_source_snapshot(source_path)
+    except Exception:
+        return [source_name], source_name, None, ""
+    try:
+        skills = detect_skills(stable.snapshot, allow_symlinks=allow_symlinks)
+        skill_names = [s.name for s in skills] if skills else [source_name]
+        return skill_names, source_name, stable.temp_root, ""
+    except Exception:
+        stable.cleanup()
+        return [source_name], source_name, None, ""
 
 
 def add(
@@ -409,6 +458,11 @@ def add(
         "--name",
         help="Rename skill (single skill only)",
     ),
+    allow_symlinks: bool = typer.Option(
+        False,
+        "--allow-symlinks",
+        help="Allow compliant relative symlinks in the source (dangerous; not persisted)",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -439,11 +493,14 @@ def add(
                 yes=yes,
                 keep_structure=keep_structure,
                 namespace=namespace,
+                allow_symlinks=allow_symlinks,
             )
         else:
             # Route 2: Standard flow (URL, local, builtin, shorthand without paths)
             if _is_external_source(source) and keep_structure is None and namespace is None:
-                skill_names, _source_name, temp_dir, commit_sha = _detect_skills_from_source(source)
+                skill_names, _source_name, temp_dir, commit_sha = _detect_skills_from_source(
+                    source, allow_symlinks=allow_symlinks
+                )
                 keep_structure, namespace = _prompt_namespace_selection(
                     skill_names,
                     source,
@@ -461,6 +518,7 @@ def add(
                 name=name,
                 pre_fetched_dir=temp_dir,
                 pre_fetched_commit_sha=commit_sha,
+                allow_symlinks=allow_symlinks,
             )
 
         # Shared: Display result

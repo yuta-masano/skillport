@@ -46,6 +46,11 @@ def update(
         "-c",
         help="Check for available updates without updating",
     ),
+    allow_symlinks: bool = typer.Option(
+        False,
+        "--allow-symlinks",
+        help="Allow compliant relative symlinks when updating (dangerous; not persisted)",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -96,6 +101,7 @@ def update(
                         force=force,
                         dry_run=dry_run,
                         skill_ids=candidate_ids,
+                        allow_symlinks=allow_symlinks,
                     )
 
                 _render_update_all_result(
@@ -123,6 +129,7 @@ def update(
                 config=config,
                 force=force,
                 dry_run=dry_run,
+                allow_symlinks=allow_symlinks,
             )
 
         # JSON output
@@ -180,6 +187,7 @@ def update(
                 config=config,
                 force=force,
                 dry_run=dry_run,
+                allow_symlinks=allow_symlinks,
             )
 
         # JSON output
@@ -244,6 +252,7 @@ def _show_available_updates(config, json_output: bool, interactive: bool = False
                 "unreadable",
                 "unknown origin",
                 "not checkable",
+                "symlink",
                 "too_many_files",
                 "too_large",
             ]

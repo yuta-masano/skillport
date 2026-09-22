@@ -4,6 +4,8 @@ Uses Typer's CliRunner for E2E CLI testing.
 """
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +15,23 @@ from typer.testing import CliRunner
 from skillport.interfaces.cli.app import app
 
 runner = CliRunner()
+
+
+def _symlink_capable() -> bool:
+    """Probe whether this platform can create symlinks (skip policy of order.md)."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink("target", Path(tmp) / "probe")
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+@pytest.fixture
+def require_symlink():
+    """Skip the target test (instead of failing setup) when symlinks cannot be created."""
+    if not _symlink_capable():
+        pytest.skip("symlinks cannot be created on this platform")
 
 
 @dataclass
@@ -631,3 +650,662 @@ class TestDocCommand:
 
         assert result.exit_code == 1
         assert "invalid" in result.stdout.lower()
+
+
+def _create_linked_skill_source(source: Path, name: str) -> Path:
+    """Create a single-skill source containing a compliant relative symlink."""
+    skill = _create_skill(source, name)
+    assets = skill / "assets"
+    assets.mkdir()
+    (assets / "manual.md").write_text("manual v1", encoding="utf-8")
+    docs = skill / "docs"
+    docs.mkdir()
+    os.symlink("../assets/manual.md", docs / "current.md")
+    return skill
+
+
+class TestAllowSymlinksCli:
+    """--allow-symlinks CLI wiring for add and update."""
+
+    def test_add_help_lists_allow_symlinks(self, skills_env: SkillsEnv):
+        """add --help documents the --allow-symlinks option."""
+        result = runner.invoke(app, ["add", "--help"])
+
+        assert result.exit_code == 0
+        assert "--allow-symlinks" in result.stdout
+
+    def test_update_help_lists_allow_symlinks(self, skills_env: SkillsEnv):
+        """update --help documents the --allow-symlinks option."""
+        result = runner.invoke(app, ["update", "--help"])
+
+        assert result.exit_code == 0
+        assert "--allow-symlinks" in result.stdout
+
+    def test_add_local_symlink_with_flag(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        """add --allow-symlinks installs the skill with the symlink preserved."""
+        source = tmp_path / "src"
+        _create_linked_skill_source(source, "linked-skill")
+
+        result = runner.invoke(app, ["add", str(source), "--allow-symlinks", "--no-keep-structure"])
+
+        assert result.exit_code == 0, result.stdout
+        current = skills_env.skills_dir / "linked-skill" / "docs" / "current.md"
+        assert current.is_symlink()
+        assert current.read_text(encoding="utf-8") == "manual v1"
+
+    def test_add_local_symlink_without_flag_is_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        """Flagless add of a symlinked local source exits non-zero without installing."""
+        source = tmp_path / "src"
+        _create_linked_skill_source(source, "linked-skill")
+
+        result = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+
+        assert result.exit_code != 0
+        assert not (skills_env.skills_dir / "linked-skill").exists()
+        assert not any(skills_env.skills_dir.rglob("current.md"))
+        assert not any(skills_env.skills_dir.rglob("manual.md"))
+
+    def test_add_local_source_root_symlink_is_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        real_skill = _create_skill(tmp_path / "outside", "linked-skill")
+        (real_skill / "external-marker.txt").write_text("secret", encoding="utf-8")
+        source = tmp_path / "source"
+        source.symlink_to(real_skill)
+
+        result = runner.invoke(app, ["add", str(source), "--allow-symlinks", "--no-keep-structure"])
+
+        assert result.exit_code != 0
+        assert not (skills_env.skills_dir / "linked-skill").exists()
+        assert not any(skills_env.skills_dir.rglob("external-marker.txt"))
+
+    def test_add_zip_symlink_with_flag(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        """add --allow-symlinks on a zip source materializes the symlink entry."""
+        import zipfile
+
+        zip_path = tmp_path / "zipped-skill.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("SKILL.md", "---\nname: zipped-skill\ndescription: Z\n---\nbody")
+            info = zipfile.ZipInfo("link.txt")
+            info.external_attr = 0o120777 << 16
+            zf.writestr(info, "SKILL.md")
+
+        result = runner.invoke(
+            app, ["add", str(zip_path), "--allow-symlinks", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        link = skills_env.skills_dir / "zipped-skill" / "link.txt"
+        assert link.is_symlink()
+        assert os.readlink(link) == "SKILL.md"
+        # Reading through the link yields the target file's content
+        assert link.read_text(encoding="utf-8") == (
+            skills_env.skills_dir / "zipped-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("link_name", [".env-link", "node_modules"], ids=["hidden", "excluded"])
+    def test_add_zip_ignores_hidden_or_excluded_root_symlink(
+        self, skills_env: SkillsEnv, tmp_path: Path, link_name: str, monkeypatch, require_symlink
+    ):
+        """Pre-detection drops root hidden/excluded symlinks and adds the flat skill."""
+        import zipfile
+
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(sandbox))
+
+        zip_path = tmp_path / "zskill.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(
+                "zskill/SKILL.md",
+                "---\nname: zskill\ndescription: Z\n---\nbody",
+            )
+            info = zipfile.ZipInfo(link_name)
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, "zskill")
+
+        result = runner.invoke(app, ["add", str(zip_path), "--allow-symlinks", "--yes"])
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added 'zskill'" in result.stdout
+        assert (skills_env.skills_dir / "zskill" / "SKILL.md").exists()
+        assert not (skills_env.skills_dir / "zskill.zip").exists()
+        assert not os.path.lexists(skills_env.skills_dir / link_name)
+        assert not os.path.lexists(skills_env.skills_dir / "zskill" / link_name)
+        assert list(sandbox.iterdir()) == []
+
+    def test_add_zip_visible_root_symlink_is_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        """A visible root symlink stays a candidate and the single-skill check rejects it."""
+        import zipfile
+
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(sandbox))
+
+        zip_path = tmp_path / "zskill.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(
+                "zskill/SKILL.md",
+                "---\nname: zskill\ndescription: Z\n---\nbody",
+            )
+            info = zipfile.ZipInfo("alias")
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, "zskill")
+
+        result = runner.invoke(app, ["add", str(zip_path), "--allow-symlinks", "--yes"])
+
+        assert result.exit_code != 0
+        assert "found 2" in result.stdout
+        assert not os.path.lexists(skills_env.skills_dir / "zskill")
+        assert not os.path.lexists(skills_env.skills_dir / "alias")
+        assert list(sandbox.iterdir()) == []
+
+    def test_update_local_symlink_with_flag(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        """update --allow-symlinks applies source changes and preserves the link."""
+        source = tmp_path / "src"
+        skill = _create_linked_skill_source(source, "linked-skill")
+
+        add_result = runner.invoke(
+            app, ["add", str(source), "--allow-symlinks", "--no-keep-structure"]
+        )
+        assert add_result.exit_code == 0, add_result.stdout
+
+        (skill / "assets" / "manual.md").write_text("manual v2", encoding="utf-8")
+
+        result = runner.invoke(app, ["update", "linked-skill", "--allow-symlinks"])
+
+        assert result.exit_code == 0, result.stdout
+        current = skills_env.skills_dir / "linked-skill" / "docs" / "current.md"
+        assert current.is_symlink()
+        assert current.read_text(encoding="utf-8") == "manual v2"
+
+    def test_update_all_with_flag_preserves_symlink(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        """update --all --allow-symlinks forwards the flag and keeps the link."""
+        source = tmp_path / "src"
+        skill = _create_linked_skill_source(source, "linked-skill")
+
+        add_result = runner.invoke(
+            app, ["add", str(source), "--allow-symlinks", "--no-keep-structure"]
+        )
+        assert add_result.exit_code == 0, add_result.stdout
+
+        (skill / "assets" / "manual.md").write_text("manual v2", encoding="utf-8")
+
+        result = runner.invoke(app, ["update", "--all", "--allow-symlinks"])
+
+        assert result.exit_code == 0, result.stdout
+        current = skills_env.skills_dir / "linked-skill" / "docs" / "current.md"
+        assert current.is_symlink()
+        assert current.read_text(encoding="utf-8") == "manual v2"
+
+    def test_update_confirm_bulk_with_flag_preserves_symlink(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        """Answering the post-check confirmation with the flag runs a bulk update keeping links."""
+        from skillport.interfaces.cli.theme import console as theme_console
+
+        source = tmp_path / "src"
+        skill = _create_linked_skill_source(source, "linked-skill")
+
+        add_result = runner.invoke(
+            app, ["add", str(source), "--allow-symlinks", "--no-keep-structure"]
+        )
+        assert add_result.exit_code == 0, add_result.stdout
+
+        (skill / "assets" / "manual.md").write_text("manual v2", encoding="utf-8")
+
+        # The confirmation prompt only runs for an interactive console
+        monkeypatch.setattr(theme_console, "is_interactive", True)
+
+        result = runner.invoke(app, ["update", "--allow-symlinks"], input="y\n")
+
+        assert result.exit_code == 0, result.stdout
+        current = skills_env.skills_dir / "linked-skill" / "docs" / "current.md"
+        assert current.is_symlink()
+        assert current.read_text(encoding="utf-8") == "manual v2"
+
+    def test_update_confirm_declined_leaves_skill_unchanged(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        """Declining the confirmation leaves the installed skill untouched."""
+        from skillport.interfaces.cli.theme import console as theme_console
+
+        source = tmp_path / "src"
+        skill = _create_linked_skill_source(source, "linked-skill")
+
+        add_result = runner.invoke(
+            app, ["add", str(source), "--allow-symlinks", "--no-keep-structure"]
+        )
+        assert add_result.exit_code == 0, add_result.stdout
+
+        (skill / "assets" / "manual.md").write_text("manual v2", encoding="utf-8")
+        monkeypatch.setattr(theme_console, "is_interactive", True)
+
+        result = runner.invoke(app, ["update", "--allow-symlinks"], input="n\n")
+
+        assert result.exit_code == 0, result.stdout
+        current = skills_env.skills_dir / "linked-skill" / "docs" / "current.md"
+        assert current.is_symlink()
+        # Declined: still the original content
+        assert current.read_text(encoding="utf-8") == "manual v1"
+
+    def test_update_check_reports_installed_root_symlink(
+        self, skills_env: SkillsEnv, tmp_path: Path, require_symlink
+    ):
+        """update --check and the default invocation reject a symlinked installed root."""
+        import shutil
+
+        source = tmp_path / "src"
+        _create_skill(source, "checked-skill")
+
+        add_result = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+        assert add_result.exit_code == 0, add_result.stdout
+
+        external = tmp_path / "external" / "checked-skill"
+        external.mkdir(parents=True)
+        (external / "SKILL.md").write_text(
+            "---\nname: checked-skill\ndescription: External\n---\nexternal body",
+            encoding="utf-8",
+        )
+        (external / "external-marker.txt").write_text("secret", encoding="utf-8")
+        installed = skills_env.skills_dir / "checked-skill"
+        shutil.rmtree(installed)
+        os.symlink(external, installed)
+
+        check_result = runner.invoke(app, ["update", "--check", "--json"])
+
+        assert check_result.exit_code == 0, check_result.stdout
+        data = json.loads(check_result.stdout)
+        assert [item["skill_id"] for item in data["not_updatable"]] == ["checked-skill"]
+        assert "symlink" in data["not_updatable"][0]["reason"].lower()
+        assert data["updates_available"] == []
+
+        default_result = runner.invoke(app, ["update", "--json"])
+
+        assert default_result.exit_code == 0, default_result.stdout
+        default_data = json.loads(default_result.stdout)
+        assert [item["skill_id"] for item in default_data["not_updatable"]] == ["checked-skill"]
+        assert "symlink" in default_data["not_updatable"][0]["reason"].lower()
+
+    def test_add_github_url_with_flag_preserves_symlink(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        """CLI GitHub URL add forwards the flag to the fetch and preserves the link."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        prepared.mkdir()
+        (prepared / "SKILL.md").write_text(
+            "---\nname: gh-url-skill\ndescription: G\n---\nbody", encoding="utf-8"
+        )
+        assets = prepared / "assets"
+        assets.mkdir()
+        (assets / "manual.md").write_text("manual", encoding="utf-8")
+        docs = prepared / "docs"
+        docs.mkdir()
+        os.symlink("../assets/manual.md", docs / "current.md")
+
+        recorded: dict = {}
+
+        def fake_fetch(url, allow_symlinks=False):
+            recorded["allow_symlinks"] = allow_symlinks
+            return SimpleNamespace(extracted_path=prepared, commit_sha="abc1234")
+
+        monkeypatch.setattr(add_cli_module, "fetch_github_source_with_info", fake_fetch)
+
+        result = runner.invoke(
+            app, ["add", "https://github.com/user/repo", "--allow-symlinks", "-y"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert recorded["allow_symlinks"] is True
+        current = skills_env.skills_dir / "gh-url-skill" / "docs" / "current.md"
+        assert current.is_symlink()
+        assert current.read_text(encoding="utf-8") == "manual"
+
+    def test_add_github_multi_path_with_flag_preserves_symlinks(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        """CLI GitHub shorthand with multiple paths forwards the flag for every path."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        for path_name, skill_name in [("path-a", "skill-aa"), ("path-b", "skill-bb")]:
+            skill = prepared / path_name / skill_name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                f"---\nname: {skill_name}\ndescription: G\n---\nbody", encoding="utf-8"
+            )
+            assets = skill / "assets"
+            assets.mkdir()
+            (assets / "manual.md").write_text(f"manual {skill_name}", encoding="utf-8")
+            docs = skill / "docs"
+            docs.mkdir()
+            os.symlink("../assets/manual.md", docs / "current.md")
+
+        recorded: dict = {}
+
+        def fake_fetch(url, allow_symlinks=False):
+            recorded["allow_symlinks"] = allow_symlinks
+            return SimpleNamespace(extracted_path=prepared, commit_sha="abc1234")
+
+        monkeypatch.setattr(add_cli_module, "fetch_github_source_with_info", fake_fetch)
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "user/repo",
+                "path-a",
+                "path-b",
+                "--allow-symlinks",
+                "--no-keep-structure",
+                "-y",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert recorded["allow_symlinks"] is True
+        for skill_name in ("skill-aa", "skill-bb"):
+            current = skills_env.skills_dir / skill_name / "docs" / "current.md"
+            assert current.is_symlink(), skill_name
+            assert current.read_text(encoding="utf-8") == f"manual {skill_name}"
+
+    def test_add_github_multi_path_rejects_symlink_ancestor_without_external_effects(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, require_symlink
+    ):
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        prepared.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _create_skill(outside, "external-skill")
+        (outside / "marker.txt").write_text("keep", encoding="utf-8")
+        (prepared / "link").symlink_to(outside, target_is_directory=True)
+
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", "link/subdir", "--allow-symlinks", "--yes"],
+        )
+
+        assert result.exit_code != 0
+        assert "symlink" in result.stdout.lower()
+        assert (outside / "external-skill" / "SKILL.md").exists()
+        assert (outside / "marker.txt").read_text(encoding="utf-8") == "keep"
+
+    def test_add_github_root_skill_keeps_parent_collision_and_cleans_extraction(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        prepared.mkdir()
+        skill_name = "root-skill"
+        (prepared / "SKILL.md").write_text(
+            f"---\nname: {skill_name}\ndescription: G\n---\nbody", encoding="utf-8"
+        )
+        collision = prepared.parent / skill_name
+        collision.mkdir()
+        marker = collision / "marker"
+        marker.write_text("keep", encoding="utf-8")
+
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", ".", "--allow-symlinks", "--yes"],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert skill_name in result.stdout
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert not prepared.exists()
+        assert (skills_env.skills_dir / skill_name / "SKILL.md").exists()
+
+    def test_add_github_prefetch_accepts_safe_frontmatter_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        prepared.mkdir()
+        (prepared / "SKILL.md").write_text(
+            "---\nname: prefetched-safe\ndescription: G\n---\nbody", encoding="utf-8"
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        marker = outside / "marker.txt"
+        marker.write_text("keep", encoding="utf-8")
+
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(app, ["add", "user/repo", ".", "--allow-symlinks", "--yes"])
+
+        assert result.exit_code == 0, result.stdout
+        assert (skills_env.skills_dir / "prefetched-safe" / "SKILL.md").exists()
+        assert marker.read_text(encoding="utf-8") == "keep"
+
+    @pytest.mark.parametrize("name_kind", ["absolute", "ancestor"])
+    def test_add_github_prefetch_rejects_unsafe_frontmatter_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch, name_kind: str
+    ):
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        escaped = tmp_path / f"{name_kind}-escape"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        marker = outside / "marker.txt"
+        marker.write_text("keep", encoding="utf-8")
+        skill_name = str(escaped) if name_kind == "absolute" else "../ancestor-escape"
+
+        prepared = tmp_path / "gh-tree"
+        prepared.mkdir()
+        (prepared / "SKILL.md").write_text(
+            f"---\nname: {skill_name}\ndescription: G\n---\nbody", encoding="utf-8"
+        )
+
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(app, ["add", "user/repo", ".", "--allow-symlinks", "--yes"])
+
+        assert result.exit_code != 0
+        assert not list(skills_env.skills_dir.iterdir())
+        assert not escaped.exists()
+        assert marker.read_text(encoding="utf-8") == "keep"
+
+
+class TestLocalSourceBoundaryCli:
+    """Local add rejects symlinked source paths before pre-detection."""
+
+    @pytest.mark.parametrize("allow", [False, True], ids=["flagless", "with-flag"])
+    def test_add_absolute_ancestor_symlink_is_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path, allow: bool, require_symlink
+    ):
+        """An absolute local source behind a symlinked ancestor exits non-zero."""
+        external = _create_skill(tmp_path / "outside", "linked-skill")
+        (external / "external-marker.txt").write_text("secret", encoding="utf-8")
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "alias").symlink_to(tmp_path / "outside", target_is_directory=True)
+
+        args = ["add", str(source / "alias" / "linked-skill"), "--no-keep-structure"]
+        if allow:
+            args.append("--allow-symlinks")
+        result = runner.invoke(app, args)
+
+        assert result.exit_code != 0, result.stdout
+        assert not (skills_env.skills_dir / "linked-skill").exists()
+        assert not any(skills_env.skills_dir.rglob("external-marker.txt"))
+        assert (external / "external-marker.txt").read_text(encoding="utf-8") == "secret"
+
+    @pytest.mark.parametrize("allow", [False, True], ids=["flagless", "with-flag"])
+    def test_add_relative_shorthand_shaped_ancestor_symlink_is_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path, allow: bool, require_symlink, monkeypatch
+    ):
+        """A shorthand-shaped local path behind a symlink is not added as a local skill."""
+        external = _create_skill(tmp_path / "outside", "repo")
+        (external / "external-marker.txt").write_text("secret", encoding="utf-8")
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "owner").symlink_to(tmp_path / "outside", target_is_directory=True)
+        monkeypatch.chdir(project)
+
+        args = ["add", "owner/repo", "--no-keep-structure"]
+        if allow:
+            args.append("--allow-symlinks")
+        result = runner.invoke(app, args)
+
+        assert result.exit_code != 0, result.stdout
+        assert not (skills_env.skills_dir / "repo").exists()
+        assert not any(skills_env.skills_dir.rglob("external-marker.txt"))
+        assert (external / "external-marker.txt").read_text(encoding="utf-8") == "secret"
+
+    def test_add_relative_shorthand_shaped_local_path_is_added(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """A regular local owner/repo directory is still added as a local source."""
+        project = tmp_path / "project"
+        _create_skill(project / "owner", "repo")
+        monkeypatch.chdir(project)
+
+        result = runner.invoke(app, ["add", "owner/repo", "--no-keep-structure"])
+
+        assert result.exit_code == 0, result.stdout
+        assert (skills_env.skills_dir / "repo" / "SKILL.md").exists()
+
+    @pytest.mark.parametrize("allow", [False, True], ids=["flagless", "with-flag"])
+    def test_add_source_swapped_at_pre_detection_boundary_is_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path, allow: bool, monkeypatch, require_symlink
+    ):
+        """A source ancestor swapped at the pre-detection boundary is not followed."""
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        external = _create_skill(tmp_path / "outside", "skill")
+        (external / "external-marker.txt").write_text("secret", encoding="utf-8")
+
+        source = tmp_path / "source"
+        _create_skill(source, "skill")
+
+        real_boundary = add_cli_module.acquire_local_source_snapshot
+        state = {"swapped": False}
+
+        def swapping_boundary(path, *args, **kwargs):
+            if not state["swapped"]:
+                state["swapped"] = True
+                source.rename(source.parent / "source-original")
+                source.symlink_to(tmp_path / "outside", target_is_directory=True)
+            return real_boundary(path, *args, **kwargs)
+
+        monkeypatch.setattr(add_cli_module, "acquire_local_source_snapshot", swapping_boundary)
+
+        args = ["add", str(source)]
+        if allow:
+            args.append("--allow-symlinks")
+        result = runner.invoke(app, args)
+
+        assert result.exit_code != 0, result.stdout
+        assert not (skills_env.skills_dir / "skill").exists()
+        assert not any(skills_env.skills_dir.rglob("external-marker.txt"))
+        assert (external / "external-marker.txt").read_text(encoding="utf-8") == "secret"
+
+
+class TestLocalSourceParentComponentCli:
+    """A local source path ending in ``..`` stays inside the skills directory."""
+
+    @pytest.mark.parametrize("path_style", ["absolute", "relative"])
+    def test_add_parent_component_source_installs_inside_skills_dir(
+        self, skills_env: SkillsEnv, tmp_path: Path, path_style: str, monkeypatch
+    ):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(sandbox))
+
+        base = tmp_path / "base"
+        _create_skill(base, "skill-a")
+        _create_skill(base, "skill-b")
+        (base / "child").mkdir()
+        marker = tmp_path / "external-marker.txt"
+        marker.write_text("secret", encoding="utf-8")
+
+        if path_style == "relative":
+            monkeypatch.chdir(tmp_path)
+            source_arg = f"./{base.name}/child/.."
+        else:
+            source_arg = str(base / "child" / "..")
+
+        result = runner.invoke(app, ["add", source_arg])
+
+        assert result.exit_code == 0, result.stdout
+        assert (skills_env.skills_dir / "base" / "skill-a" / "SKILL.md").exists()
+        assert (skills_env.skills_dir / "base" / "skill-b" / "SKILL.md").exists()
+        assert not (skills_env.skills_dir.parent / "skill-a").exists()
+        assert not (skills_env.skills_dir.parent / "skill-b").exists()
+        assert not any(skills_env.skills_dir.rglob("external-marker.txt"))
+        assert marker.read_text(encoding="utf-8") == "secret"
+        assert list(sandbox.iterdir()) == []

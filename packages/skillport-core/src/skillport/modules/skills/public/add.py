@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from skillport.modules.skills.internal import (
     SkillInfo,
+    acquire_local_source_snapshot,
     compute_content_hash,
     detect_skills,
     extract_zip,
     fetch_github_source_with_info,
+    has_hidden_or_excluded_component,
     parse_github_url,
     record_origin,
     rename_single_skill_dir,
     resolve_source,
+    validate_skill_name_for_path,
 )
 from skillport.modules.skills.internal import (
     add_builtin as _add_builtin,
@@ -23,6 +27,7 @@ from skillport.modules.skills.internal import (
 )
 from skillport.shared.config import Config
 from skillport.shared.types import SourceType
+from skillport.shared.utils import SymlinkPathError, find_symlink_path_component
 
 from .types import AddResult, AddResultItem
 
@@ -53,6 +58,7 @@ class AddContext:
     keep_structure: bool | None
     namespace: str | None
     name: str | None
+    allow_symlinks: bool = False
     # Accumulated results
     details: list[AddResultItem] = field(default_factory=list)
     added_ids: list[str] = field(default_factory=list)
@@ -60,6 +66,7 @@ class AddContext:
     messages_added: list[str] = field(default_factory=list)
     messages_skipped: list[str] = field(default_factory=list)
     zip_added_ids: set[str] = field(default_factory=set)
+    source_relative_paths: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -69,19 +76,24 @@ def _prepare_github(
     resolved: str,
     pre_fetched_dir: Path | None,
     pre_fetched_commit_sha: str,
+    *,
+    allow_symlinks: bool = False,
+    cleanup_pre_fetched_dir: bool = True,
 ) -> PrepareResult:
     """Prepare GitHub source for skill addition."""
     parsed = parse_github_url(resolved)
     if pre_fetched_dir:
-        temp_dir = Path(pre_fetched_dir)
+        source_path = Path(pre_fetched_dir)
+        temp_dir = source_path if cleanup_pre_fetched_dir else None
         commit_sha = pre_fetched_commit_sha
     else:
-        fetch_result = fetch_github_source_with_info(resolved)
-        temp_dir = fetch_result.extracted_path
+        fetch_result = fetch_github_source_with_info(resolved, allow_symlinks=allow_symlinks)
+        source_path = fetch_result.extracted_path
+        temp_dir = source_path
         commit_sha = fetch_result.commit_sha
 
     return PrepareResult(
-        source_path=Path(temp_dir),
+        source_path=source_path,
         source_label=Path(parsed.normalized_path or parsed.repo).name,
         origin_payload={
             "source": resolved,
@@ -91,15 +103,15 @@ def _prepare_github(
             "commit_sha": commit_sha,
         },
         temp_dir=temp_dir,
-        cleanup_temp_dir=True,
+        cleanup_temp_dir=temp_dir is not None,
         commit_sha=commit_sha,
     )
 
 
-def _prepare_zip(resolved: str) -> PrepareResult:
+def _prepare_zip(resolved: str, *, allow_symlinks: bool = False) -> PrepareResult:
     """Prepare ZIP source for skill addition."""
     zip_path = Path(resolved)
-    extract_result = extract_zip(zip_path)
+    extract_result = extract_zip(zip_path, allow_symlinks=allow_symlinks)
     return PrepareResult(
         source_path=extract_result.extracted_path,
         source_label=zip_path.stem,
@@ -107,7 +119,7 @@ def _prepare_zip(resolved: str) -> PrepareResult:
             "source": resolved,
             "kind": "zip",
             "path": "",
-            "source_mtime": zip_path.stat().st_mtime_ns,
+            "source_mtime": extract_result.source_mtime_ns,
         },
         temp_dir=extract_result.extracted_path,
         cleanup_temp_dir=True,
@@ -115,12 +127,19 @@ def _prepare_zip(resolved: str) -> PrepareResult:
 
 
 def _prepare_local(resolved: str) -> PrepareResult:
-    """Prepare local directory source for skill addition."""
-    source_path = Path(resolved)
+    """Prepare local directory source for skill addition.
+
+    The source tree is materialized through a no-follow descriptor chain and
+    every later step (detection, validation, snapshot, copy) reads that
+    snapshot. The origin keeps the original local path, never the snapshot.
+    """
+    source = acquire_local_source_snapshot(Path(resolved))
     return PrepareResult(
-        source_path=source_path,
-        source_label=source_path.name,
-        origin_payload={"source": str(source_path), "kind": "local", "path": ""},
+        source_path=source.snapshot,
+        source_label=source.snapshot.name,
+        origin_payload={"source": resolved, "kind": "local", "path": ""},
+        temp_dir=source.temp_root,
+        cleanup_temp_dir=True,
     )
 
 
@@ -143,27 +162,78 @@ def _validate_zip_skills(skills: list[SkillInfo], source_path: Path) -> AddResul
     return None
 
 
+def _drop_hidden_or_excluded_symlink_candidates(
+    temp_dir: Path, skills: list[SkillInfo]
+) -> list[SkillInfo]:
+    """Drop root candidates whose own path is a hidden or excluded symlink.
+
+    Such a link is not an archive entry that should participate in selecting the
+    single skill. Symlinks inside the selected skill remain in the list and are
+    validated by the normal per-skill copy checks.
+    """
+    kept: list[SkillInfo] = []
+    for skill in skills:
+        if skill.source_path.is_symlink() and has_hidden_or_excluded_component(
+            skill.source_path.relative_to(temp_dir).parts
+        ):
+            continue
+        kept.append(skill)
+    return kept
+
+
 def _handle_single_skill_rename(
     prepare: PrepareResult,
     skills: list[SkillInfo],
     source_type: SourceType,
+    *,
+    allow_symlinks: bool = False,
 ) -> tuple[PrepareResult, list[SkillInfo]]:
-    """Rename temp directory for single skill and update origin path."""
+    """Prepare a single-skill source for addition."""
     if source_type not in (SourceType.GITHUB, SourceType.ZIP) or len(skills) != 1:
         return prepare, skills
 
     single = skills[0]
-    new_source_path = rename_single_skill_dir(prepare.source_path, single.name)
-    new_skills = detect_skills(new_source_path)
-
-    # Update origin.path for single skill
-    new_origin = dict(prepare.origin_payload)
-    new_origin["path"] = new_origin.get("path") or single.name
+    if single.error is not None:
+        return prepare, skills
+    if not prepare.cleanup_temp_dir and single.source_path == prepare.source_path:
+        try:
+            validate_skill_name_for_path(single.name)
+        except ValueError:
+            return prepare, skills
+        staging_root: Path | None = None
+        try:
+            staging_root = Path(
+                tempfile.mkdtemp(prefix="skillport-single-", dir=prepare.source_path.parent)
+            )
+            nested_source = staging_root / single.name
+            shutil.copytree(prepare.source_path, nested_source, symlinks=True)
+        except Exception:
+            if staging_root is not None:
+                shutil.rmtree(staging_root, ignore_errors=True)
+            return prepare, skills
+        try:
+            new_skills = detect_skills(nested_source, allow_symlinks=allow_symlinks)
+        except BaseException:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
+        return PrepareResult(
+            source_path=nested_source,
+            source_label=prepare.source_label,
+            origin_payload=dict(prepare.origin_payload),
+            temp_dir=staging_root,
+            cleanup_temp_dir=True,
+            commit_sha=prepare.commit_sha,
+        ), new_skills
+    try:
+        new_source_path = rename_single_skill_dir(prepare.source_path, single.name)
+    except ValueError:
+        return prepare, skills
+    new_skills = detect_skills(new_source_path, allow_symlinks=allow_symlinks)
 
     return PrepareResult(
         source_path=new_source_path,
         source_label=prepare.source_label,
-        origin_payload=new_origin,
+        origin_payload=prepare.origin_payload,
         temp_dir=new_source_path,
         cleanup_temp_dir=prepare.cleanup_temp_dir,
         commit_sha=prepare.commit_sha,
@@ -178,32 +248,33 @@ def _determine_structure_options(
     source_label: str,
     keep_structure: bool | None,
     namespace: str | None,
-    origin_payload: dict,
-) -> tuple[bool, str | None, dict]:
+) -> tuple[bool, str | None]:
     """Determine effective keep_structure and namespace_override."""
     effective_keep_structure = keep_structure
     namespace_override = namespace
-    updated_origin = dict(origin_payload)
 
     if len(skills) == 1:
         effective_keep_structure = (
             False if effective_keep_structure is None else effective_keep_structure
         )
-        # Single skill: fix path to skill name
-        if not updated_origin.get("path"):
-            updated_origin["path"] = skills[0].name
     else:
         if effective_keep_structure is None:
             effective_keep_structure = True
         if effective_keep_structure and namespace_override is None:
             namespace_override = source_label
 
-    return bool(effective_keep_structure), namespace_override, updated_origin
+    return bool(effective_keep_structure), namespace_override
 
 
 # ---------------------------------------------------------------------------
 # Skill processing
 # ---------------------------------------------------------------------------
+def _is_zip_candidate(path: Path) -> bool:
+    if path.suffix.lower() != ".zip":
+        return False
+    return find_symlink_path_component(path) is not None or path.is_file()
+
+
 def _process_directory_skills(
     ctx: AddContext,
     skills: list[SkillInfo],
@@ -222,6 +293,7 @@ def _process_directory_skills(
         force=ctx.force,
         namespace_override=namespace_override,
         rename_single_to=ctx.name,
+        allow_symlinks=ctx.allow_symlinks,
     )
 
     ctx.details = [
@@ -232,26 +304,59 @@ def _process_directory_skills(
     ctx.messages_added = [r.message for r in results if r.success and r.message]
     ctx.messages_skipped = [r.message for r in results if not r.success and r.message]
 
+    for skill, result in zip(skills, results, strict=True):
+        if not result.success:
+            continue
+        relative = skill.source_path.relative_to(ctx.prepare.source_path).as_posix()
+        ctx.source_relative_paths[result.skill_id] = "" if relative == "." else relative
+
 
 def _process_nested_zips(ctx: AddContext) -> None:
     """Process ZIP files in LOCAL directory (recursive)."""
     source_path = ctx.prepare.source_path
-    if ctx.source_type != SourceType.LOCAL or (source_path / "SKILL.md").exists():
+    if (
+        ctx.source_type != SourceType.LOCAL
+        or source_path.is_symlink()
+        or (source_path / "SKILL.md").exists()
+    ):
         return
 
-    zip_files = sorted(
-        f for f in source_path.iterdir() if f.is_file() and f.suffix.lower() == ".zip"
-    )
+    # The recursive add re-opens the original path (never the snapshot) so the
+    # recorded origin points at the caller's source; the boundary is acquired
+    # again for that path.
+    origin_root = Path(str(ctx.prepare.origin_payload.get("source", "")))
+    zip_files = sorted(f for f in source_path.iterdir() if _is_zip_candidate(f))
 
     for zip_file in zip_files:
+        try:
+            add_path = origin_root / zip_file.relative_to(source_path)
+        except ValueError:
+            add_path = zip_file
         # Use user-specified namespace only (not directory-derived namespace_override)
-        zip_result = add_skill(
-            str(zip_file),
-            config=ctx.config,
-            force=ctx.force,
-            namespace=ctx.namespace,
-            keep_structure=ctx.namespace is not None,
-        )
+        try:
+            zip_result = add_skill(
+                str(add_path),
+                config=ctx.config,
+                force=ctx.force,
+                namespace=ctx.namespace,
+                keep_structure=ctx.namespace is not None,
+                allow_symlinks=ctx.allow_symlinks,
+            )
+        except SymlinkPathError as exc:
+            candidate_id = zip_file.name
+            zip_result = AddResult(
+                success=False,
+                skill_id=candidate_id,
+                message=str(exc),
+                skipped=[candidate_id],
+                details=[
+                    AddResultItem(
+                        skill_id=candidate_id,
+                        success=False,
+                        message=str(exc),
+                    )
+                ],
+            )
         # Merge results
         if zip_result.details:
             ctx.details.extend(zip_result.details)
@@ -276,7 +381,6 @@ def _record_skill_origins(ctx: AddContext) -> None:
         return
 
     origin_payload = ctx.prepare.origin_payload
-    source_path = ctx.prepare.source_path
 
     for sid in ctx.added_ids:
         # Skip skills added via nested ZIP (already recorded in recursive call)
@@ -286,17 +390,7 @@ def _record_skill_origins(ctx: AddContext) -> None:
             skill_path = ctx.config.skills_dir / sid
             content_hash = compute_content_hash(skill_path)
 
-            # Determine relative path for this skill
-            rel_path = ""
-            if source_path.exists():
-                try:
-                    rel_path = (
-                        (source_path / sid.split("/")[-1])
-                        .relative_to(source_path)
-                        .as_posix()
-                    )
-                except Exception:
-                    rel_path = sid.split("/")[-1]
+            rel_path = ctx.source_relative_paths[sid]
 
             # Build enriched payload
             enriched_payload = dict(origin_payload)
@@ -408,11 +502,15 @@ def add_skill(
     name: str | None = None,
     pre_fetched_dir: Path | None = None,
     pre_fetched_commit_sha: str = "",
+    allow_symlinks: bool = False,
+    cleanup_pre_fetched_dir: bool = True,
 ) -> AddResult:
     """Add a skill from builtin/local/github source."""
     # 1. Resolve source type
     try:
         source_type, resolved = resolve_source(source)
+    except SymlinkPathError:
+        raise
     except Exception as exc:
         return AddResult(success=False, skill_id="", message=str(exc))
 
@@ -422,15 +520,24 @@ def add_skill(
 
     # 3. Prepare source
     if source_type == SourceType.GITHUB:
-        prepare = _prepare_github(resolved, pre_fetched_dir, pre_fetched_commit_sha)
+        prepare = _prepare_github(
+            resolved,
+            pre_fetched_dir,
+            pre_fetched_commit_sha,
+            allow_symlinks=allow_symlinks,
+            cleanup_pre_fetched_dir=cleanup_pre_fetched_dir,
+        )
     elif source_type == SourceType.ZIP:
-        prepare = _prepare_zip(resolved)
+        prepare = _prepare_zip(resolved, allow_symlinks=allow_symlinks)
     else:
         prepare = _prepare_local(resolved)
 
     try:
         # 4. Detect skills
-        skills = detect_skills(prepare.source_path)
+        skills = detect_skills(prepare.source_path, allow_symlinks=allow_symlinks)
+        if source_type == SourceType.ZIP and allow_symlinks:
+            # Ignore archive-level hidden or excluded links before selecting its skill.
+            skills = _drop_hidden_or_excluded_symlink_candidates(prepare.source_path, skills)
 
         # 5. Validate ZIP single-skill constraint
         if source_type == SourceType.ZIP:
@@ -439,15 +546,30 @@ def add_skill(
                 return error
 
         # 6. Handle single skill directory rename
-        prepare, skills = _handle_single_skill_rename(prepare, skills, source_type)
+        prepare, skills = _handle_single_skill_rename(
+            prepare,
+            skills,
+            source_type,
+            allow_symlinks=allow_symlinks,
+        )
+        if source_type == SourceType.ZIP and allow_symlinks:
+            # Renaming the temporary ZIP root runs detection again, so apply the
+            # archive-level filter to that second candidate list as well.
+            skills = _drop_hidden_or_excluded_symlink_candidates(prepare.source_path, skills)
 
         # 7. Check for nested ZIP files in LOCAL directory
-        has_zip_files = (
+        root_detection_error = any(
+            skill.source_path == prepare.source_path and skill.error is not None for skill in skills
+        )
+        can_process_nested_zips = (
             source_type == SourceType.LOCAL
+            and not root_detection_error
+            and not prepare.source_path.is_symlink()
+        )
+        has_zip_files = (
+            can_process_nested_zips
             and not (prepare.source_path / "SKILL.md").exists()
-            and any(
-                f.is_file() and f.suffix.lower() == ".zip" for f in prepare.source_path.iterdir()
-            )
+            and any(_is_zip_candidate(f) for f in prepare.source_path.iterdir())
         )
 
         if not skills and not has_zip_files:
@@ -458,14 +580,12 @@ def add_skill(
             )
 
         # 8. Determine structure options
-        effective_keep_structure, namespace_override, updated_origin = _determine_structure_options(
+        effective_keep_structure, namespace_override = _determine_structure_options(
             skills,
             prepare.source_label,
             keep_structure,
             namespace,
-            prepare.origin_payload,
         )
-        prepare.origin_payload.update(updated_origin)
 
         # 9. Create context
         ctx = AddContext(
@@ -476,13 +596,15 @@ def add_skill(
             keep_structure=keep_structure,
             namespace=namespace,
             name=name,
+            allow_symlinks=allow_symlinks,
         )
 
         # 10. Process directory skills
         _process_directory_skills(ctx, skills, effective_keep_structure, namespace_override)
 
         # 11. Process nested ZIPs (LOCAL only)
-        _process_nested_zips(ctx)
+        if can_process_nested_zips:
+            _process_nested_zips(ctx)
 
         # 12. Record origins
         _record_skill_origins(ctx)

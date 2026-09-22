@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import tarfile
@@ -11,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import requests
 
 from skillport.shared.auth import TokenResult, is_gh_cli_available, resolve_github_token
-from skillport.shared.utils import resolve_inside
+from skillport.shared.utils import reject_symlink_ancestor, resolve_inside
 
 GITHUB_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)(?:/(?:tree|blob)/(?P<ref>[^/]+)(?P<path>/.*)?)?/?$"
@@ -236,12 +237,43 @@ def _extract_commit_sha_from_root(root_dir_name: str, owner: str, repo: str) -> 
     return ""
 
 
-def extract_tarball(tar_path: Path, parsed: ParsedGitHubURL) -> tuple[Path, str]:
+def _materialize_tar_symlink(dest_path: Path, member: tarfile.TarInfo) -> None:
+    """Create a tar issym member as a real symlink.
+
+    The link is materialized as-is so that a violating target is rejected per
+    skill by the common preserve validation during copy, instead of failing the
+    whole extraction. Regular-file extraction still refuses to write through a
+    symlinked parent directory (reject_symlink_ancestor).
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(member.linkname, dest_path)
+    except OSError as e:
+        raise ValueError(f"Failed to create symlink {member.name}: {e}") from e
+
+
+def extract_tarball(
+    tar_path: Path, parsed: ParsedGitHubURL, *, allow_symlinks: bool = False
+) -> tuple[Path, str]:
+    dest_root = Path(tempfile.mkdtemp(prefix="skillport-gh-"))
+    try:
+        return _extract_tarball_contents(dest_root, tar_path, parsed, allow_symlinks=allow_symlinks)
+    except BaseException:
+        shutil.rmtree(dest_root, ignore_errors=True)
+        raise
+
+
+def _extract_tarball_contents(
+    dest_root: Path,
+    tar_path: Path,
+    parsed: ParsedGitHubURL,
+    *,
+    allow_symlinks: bool = False,
+) -> tuple[Path, str]:
     """Extract tarball and return (extracted_path, commit_sha).
 
     The commit SHA is extracted from the tarball root directory name.
     """
-    dest_root = Path(tempfile.mkdtemp(prefix="skillport-gh-"))
     commit_sha = ""
 
     with tarfile.open(tar_path, "r:gz") as tar:
@@ -260,21 +292,44 @@ def extract_tarball(tar_path: Path, parsed: ParsedGitHubURL) -> tuple[Path, str]
             target_prefix = f"{root}/"
 
         total_bytes = 0
+        written_paths: set[str] = set()
         for member in _iter_members_for_prefix(tar, target_prefix):
             if not member.name:
                 continue
 
             rel_posix = _tar_rel_posix_path(member.name)
             parts = PurePosixPath(rel_posix).parts
+            if not allow_symlinks and (member.islnk() or member.issym()):
+                raise ValueError(f"Symlinks are not allowed in GitHub source: {member.name}")
+            if member.islnk():
+                raise ValueError(f"Hard links are not allowed in GitHub source: {member.name}")
+            if member.issym():
+                # Materialized before the hidden/excluded filter: a link whose
+                # own path is hidden or excluded must be rejected per skill by
+                # the common preserve validation instead of being dropped here.
+                if rel_posix in written_paths:
+                    raise ValueError(f"Duplicate tar entry: {member.name}")
+                reject_symlink_ancestor(dest_root, rel_posix)
+                symlink_path = dest_root.joinpath(*parts)
+                if symlink_path.exists() or symlink_path.is_symlink():
+                    raise ValueError(f"Tar entry destination already exists: {member.name}")
+                _materialize_tar_symlink(symlink_path, member)
+                written_paths.add(rel_posix)
+                continue
             if any(p in EXCLUDE_NAMES or p.startswith(".") for p in parts):
                 continue
-            if member.islnk() or member.issym():
-                raise ValueError(f"Symlinks are not allowed in GitHub source: {member.name}")
+            if rel_posix in written_paths:
+                raise ValueError(f"Duplicate tar entry: {member.name}")
 
+            reject_symlink_ancestor(dest_root, rel_posix)
+            raw_dest_path = dest_root.joinpath(*parts)
+            if raw_dest_path.is_symlink():
+                raise ValueError(f"Archive path ends at a symlink: {member.name}")
             dest_path = resolve_inside(dest_root, rel_posix)
 
             if member.isdir():
                 dest_path.mkdir(parents=True, exist_ok=True)
+                written_paths.add(rel_posix)
                 continue
 
             if member.size > MAX_FILE_BYTES:
@@ -295,6 +350,7 @@ def extract_tarball(tar_path: Path, parsed: ParsedGitHubURL) -> tuple[Path, str]
                         if total_bytes > MAX_EXTRACTED_BYTES:
                             raise ValueError("Extracted skill exceeds 100MB limit")
                         f.write(chunk)
+            written_paths.add(rel_posix)
 
     return dest_root, commit_sha
 
@@ -305,13 +361,15 @@ def fetch_github_source(url: str) -> Path:
     return result.extracted_path
 
 
-def fetch_github_source_with_info(url: str) -> GitHubFetchResult:
+def fetch_github_source_with_info(url: str, *, allow_symlinks: bool = False) -> GitHubFetchResult:
     """Fetch GitHub source and return extracted path with commit info."""
     auth = resolve_github_token()
     parsed = parse_github_url(url, resolve_default_branch=True, auth=auth)
     tar_path = download_tarball(parsed, auth)
     try:
-        extracted_path, commit_sha = extract_tarball(tar_path, parsed)
+        extracted_path, commit_sha = extract_tarball(
+            tar_path, parsed, allow_symlinks=allow_symlinks
+        )
         return GitHubFetchResult(
             extracted_path=extracted_path,
             commit_sha=commit_sha,
@@ -387,14 +445,41 @@ def rename_single_skill_dir(extracted_dir: Path, skill_name: str) -> Path:
     Returns:
         The renamed path (or original if no rename needed)
     """
+    if extracted_dir.is_symlink():
+        raise ValueError(f"Cannot rename symlinked extraction path: {extracted_dir}")
+    if extracted_dir.parent.is_symlink():
+        raise ValueError(f"Cannot rename within symlinked extraction path: {extracted_dir.parent}")
+
+    validate_skill_name_for_path(skill_name)
+
     if skill_name == extracted_dir.name:
         return extracted_dir
 
     renamed = extracted_dir.parent / skill_name
+    if renamed.is_symlink():
+        raise ValueError(f"Cannot replace symlinked extraction path: {renamed}")
     if renamed.exists():
-        shutil.rmtree(renamed)
+        raise ValueError(f"Cannot replace existing extraction path: {renamed}")
     extracted_dir.rename(renamed)
     return renamed
+
+
+def validate_skill_name_for_path(skill_name: str) -> None:
+    if not isinstance(skill_name, str):
+        raise ValueError(f"Invalid skill name for extraction path: {skill_name}")
+
+    skill_path = PurePosixPath(skill_name)
+    if (
+        not skill_name
+        or "/" in skill_name
+        or "\\" in skill_name
+        or ":" in skill_name
+        or "\x00" in skill_name
+        or skill_path.is_absolute()
+        or len(skill_path.parts) != 1
+        or skill_path.parts[0] in ("", ".", "..")
+    ):
+        raise ValueError(f"Invalid skill name for extraction path: {skill_name}")
 
 
 def get_remote_tree_hash(parsed: ParsedGitHubURL, token: str | None, path: str) -> str:
@@ -462,3 +547,37 @@ def get_remote_tree_hash(parsed: ParsedGitHubURL, token: str | None, path: str) 
         hasher.update(b"\x00")
 
     return f"sha256:{hasher.hexdigest()}"
+
+
+def get_remote_tree_symlinks(parsed: ParsedGitHubURL, token: str | None, path: str) -> list[str]:
+    """List symlink entries (mode 120000) under path via the tree API.
+
+    Uses the same cached tree as get_remote_tree_hash, so calling both costs a
+    single API fetch. Hidden and excluded paths are included so flagless
+    callers reject links before archive visibility filtering. Returns [] when
+    the tree cannot be fetched.
+    """
+    try:
+        tree = _fetch_tree(parsed, token)
+    except Exception:
+        return []
+
+    base_path = (path or parsed.normalized_path).rstrip("/")
+    prefix = f"{base_path}/" if base_path else ""
+
+    entries = tree.get("tree", [])
+    if not isinstance(entries, list):
+        return []
+
+    symlink_paths: list[str] = []
+    for entry in entries:
+        if entry.get("type") != "blob" or entry.get("mode") != "120000":
+            continue
+        entry_path = entry.get("path", "")
+        if not entry_path.startswith(prefix):
+            continue
+        rel = entry_path[len(prefix) :] if prefix else entry_path
+        if not rel:
+            continue
+        symlink_paths.append(rel)
+    return symlink_paths

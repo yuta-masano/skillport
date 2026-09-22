@@ -30,6 +30,11 @@ wheels/
 .skillport/
 # Legacy path (pre-rename)
 .skillport/
+# Temporary work directories
+skillport-gh-*
+skillport-source-*
+skillport-update-*
+skillport-zip-*
 
 # Local Agent / Skills Directory (runtime data)
 # .agent/
@@ -48,6 +53,10 @@ Thumbs.db
 .dmypy.json
 .cache/
 coverage.xml
+uv-*.lock
 
 # documents (local only, not tracked in remote)
 docs/
+
+# Local-only data
+/.local/
