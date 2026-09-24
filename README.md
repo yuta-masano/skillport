@@ -310,6 +310,24 @@ uv run skillport --help
 uv run pytest
 ```
 
+### Install from a local build
+
+Install locally built packages with `uv tool install`. Workspace dependencies (e.g., `skillport-core`) are built from the local source, not PyPI:
+
+```bash
+# CLI
+uv tool install .
+
+# MCP server
+uv tool install ./packages/skillport-mcp
+
+# Reinstall over an existing installation
+uv tool install --force .
+
+# Track local code changes without reinstalling
+uv tool install --editable ./packages/skillport-mcp
+```
+
 ---
 
 ## License
