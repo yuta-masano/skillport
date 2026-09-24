@@ -703,16 +703,33 @@ skillport validate [target] [options]
 
 **Allowed frontmatter keys:**
 
-| Source | Keys |
-|--------|------|
-| agentskills.io | `name`, `description`, `license`, `allowed-tools`, `metadata`, `compatibility` |
-| Claude Code 2.1.0+ | `model`, `context`, `agent`, `hooks`, `user-invocable` |
+SkillPort validates the standard keys by value and accepts product-specific keys as known, non-standard extensions. A top-level key outside this table is fatal.
+
+| Source | Keys | Validation |
+|--------|------|------------|
+| agentskills.io (standard) | `name`, `description`, `license`, `allowed-tools`, `metadata`, `compatibility` | Values validated |
+| Claude Code (vendor) | `when_to_use`, `argument-hint`, `arguments`, `disable-model-invocation`, `user-invocable`, `disallowed-tools`, `model`, `effort`, `context`, `agent`, `background`, `hooks`, `paths`, `shell` | Key accepted, value not validated |
+| Cursor (vendor) | `paths`, `disable-model-invocation`, `icon`, `color`, `globs` (legacy) | Key accepted, value not validated |
+
+`paths` and `disable-model-invocation` are shared by Claude Code and Cursor. Using any vendor key produces one aggregated warning per skill that names the keys and their products. Vendor values are never validated: any value shape is accepted, and the warning is the only result.
+
+**Vendor key sources** (checked 2026-09-24):
+
+| Product | Primary source | Verified version |
+|---------|----------------|------------------|
+| Claude Code | `https://code.claude.com/docs/en/skills` | 未確認 (unverified; the page states no overall version and marks `background` as requiring v2.1.218+) |
+| Cursor | `https://cursor.com/docs/skills` | 未確認 (unverified; the page states no version for these fields) |
+
+Products with no product-specific top-level keys: OpenAI Codex (its own settings live in `agents/openai.yaml`), GitHub Copilot (provenance lives in the standard `metadata` key), Gemini CLI, and Google Antigravity (confirmed spec: `name` and `description` only).
 
 **Warning (warning only)**
 
 | Rule | Description |
 |------|-------------|
 | SKILL.md ≤ 500 lines | File is too long |
+| vendor-specific frontmatter keys | One warning per skill listing the vendor keys and the products that define them |
+
+Warnings never fail validation and do not change the `add` exit code. `skillport add` reports the same warnings for successfully added skills in its human-readable output and in the `warnings` field of each `--json` detail entry; failed and skipped skills carry no warnings.
 
 #### Examples
 

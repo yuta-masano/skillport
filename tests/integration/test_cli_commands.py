@@ -52,6 +52,19 @@ def _create_skill(path: Path, name: str, description: str = "Test skill") -> Pat
     return skill_dir
 
 
+def _create_vendor_skill(
+    path: Path, name: str, frontmatter: str = "model: sonnet\nicon: toolbox"
+) -> Path:
+    """Helper to create a skill that uses vendor-specific frontmatter keys."""
+    skill_dir = path / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: A vendor skill\n{frontmatter}\n---\n# {name}\n\nInstructions here.",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
 @pytest.fixture
 def skills_env(tmp_path: Path, monkeypatch) -> SkillsEnv:
     """Fixture providing isolated skills environment."""
@@ -1309,3 +1322,457 @@ class TestLocalSourceParentComponentCli:
         assert not any(skills_env.skills_dir.rglob("external-marker.txt"))
         assert marker.read_text(encoding="utf-8") == "secret"
         assert list(sandbox.iterdir()) == []
+
+
+class TestVendorFrontmatterWarningsCli:
+    """Vendor keys are allowed with a non-fatal warning (order.md §4 Rule 2, §3.4-3.5)."""
+
+    def test_validate_vendor_keys_warns_and_exits_0(self, skills_env: SkillsEnv):
+        _create_vendor_skill(skills_env.skills_dir, "vendor-skill")
+
+        result = runner.invoke(app, ["validate"])
+
+        assert result.exit_code == 0, result.stdout
+        assert "warning" in result.stdout.lower()
+        assert "Claude Code" in result.stdout
+        assert "model" in result.stdout
+
+    def test_validate_vendor_keys_json_reports_warning(self, skills_env: SkillsEnv):
+        _create_vendor_skill(skills_env.skills_dir, "vendor-skill")
+
+        result = runner.invoke(app, ["validate", "--json"])
+
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert data["valid"] is True
+        skill_entry = next(s for s in data["skills"] if s["id"] == "vendor-skill")
+        warnings = [i for i in skill_entry["issues"] if i["severity"] == "warning"]
+        assert len(warnings) == 1
+        message = warnings[0]["message"]
+        assert "model" in message
+        assert "icon" in message
+        assert "Claude Code" in message
+        assert "Cursor" in message
+
+    def test_add_vendor_skill_succeeds_with_warning(self, skills_env: SkillsEnv, tmp_path: Path):
+        source = tmp_path / "source"
+        _create_vendor_skill(source, "vendor-skill")
+
+        result = runner.invoke(
+            app, ["add", str(source / "vendor-skill"), "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Claude Code" in result.stdout
+        assert "model" in result.stdout
+        assert (skills_env.skills_dir / "vendor-skill" / "SKILL.md").exists()
+
+    def test_add_vendor_skill_json_includes_warning(self, skills_env: SkillsEnv, tmp_path: Path):
+        source = tmp_path / "source"
+        _create_vendor_skill(source, "vendor-skill")
+
+        result = runner.invoke(
+            app,
+            ["add", str(source / "vendor-skill"), "--no-keep-structure", "--json"],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert len(data["details"]) == 1
+        details = data["details"][0]
+        assert details["success"] is True
+        warnings = details["warnings"]
+        assert len(warnings) == 1
+        message = warnings[0]["message"]
+        assert "model" in message
+        assert "icon" in message
+        assert "Claude Code" in message
+        assert "Cursor" in message
+
+    def test_add_unknown_key_still_fails(self, skills_env: SkillsEnv, tmp_path: Path):
+        source = tmp_path / "source"
+        skill_dir = source / "bad-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bad-skill\ndescription: bad\nbogus-field:\n  unexpected: true\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["add", str(skill_dir), "--no-keep-structure"])
+
+        assert result.exit_code == 1, result.stdout
+        assert not (skills_env.skills_dir / "bad-skill").exists()
+
+    def test_add_mapping_hooks_value_succeeds_with_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        source = tmp_path / "source"
+        skill_dir = source / "hooks-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: hooks-skill\ndescription: test\nhooks:\n  unexpected: true\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["add", str(skill_dir), "--no-keep-structure", "--json"])
+
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert len(data["details"]) == 1
+        detail = data["details"][0]
+        assert detail["success"] is True
+        warnings = detail["warnings"]
+        assert len(warnings) == 1
+        assert "hooks" in warnings[0]["message"]
+        assert (skills_env.skills_dir / "hooks-skill" / "SKILL.md").exists()
+
+    def test_add_mapping_unknown_key_is_rejected(self, skills_env: SkillsEnv, tmp_path: Path):
+        source = tmp_path / "source"
+        skill_dir = source / "bogus-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bogus-skill\ndescription: test\nbogus-field:\n  unexpected: true\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["add", str(skill_dir), "--no-keep-structure", "--json"])
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert len(data["details"]) == 1
+        detail = data["details"][0]
+        assert detail["success"] is False
+        assert detail["warnings"] == []
+        assert not (skills_env.skills_dir / "bogus-skill").exists()
+
+    def test_batch_add_separates_failure_detail_and_vendor_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        source = tmp_path / "source"
+        bad_dir = source / "bad-skill"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "SKILL.md").write_text(
+            "---\nname: bad-skill\ndescription: bad\nbogus-field: value\n---\nbody",
+            encoding="utf-8",
+        )
+        _create_vendor_skill(source, "vendor-skill", "icon: toolbox")
+
+        result = runner.invoke(app, ["add", str(source), "--no-keep-structure", "--json"])
+
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        details = {d["skill_id"]: d for d in data["details"]}
+        assert set(details) == {"bad-skill", "vendor-skill"}
+        assert details["bad-skill"]["success"] is False
+        assert details["bad-skill"]["warnings"] == []
+        assert details["vendor-skill"]["success"] is True
+        warnings = details["vendor-skill"]["warnings"]
+        assert len(warnings) == 1
+        assert "icon" in warnings[0]["message"]
+        assert (skills_env.skills_dir / "vendor-skill" / "SKILL.md").exists()
+        assert not (skills_env.skills_dir / "bad-skill").exists()
+
+    def test_batch_add_all_unknown_keys_fail_without_warnings(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        source = tmp_path / "source"
+        for name in ("bad-skill", "vendor-skill"):
+            skill_dir = source / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: bad\nbogus-field: value\n---\nbody",
+                encoding="utf-8",
+            )
+
+        result = runner.invoke(app, ["add", str(source), "--no-keep-structure", "--json"])
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert len(data["details"]) == 2
+        assert all(d["success"] is False for d in data["details"])
+        assert all(d["warnings"] == [] for d in data["details"])
+        assert not (skills_env.skills_dir / "bad-skill").exists()
+        assert not (skills_env.skills_dir / "vendor-skill").exists()
+
+
+class TestFrontmatterKeyFatalCli:
+    """Unregistered top-level keys stay fatal for validate (order.md §4 Rule 1)."""
+
+    def test_validate_unknown_top_level_key_is_invalid(self, skills_env: SkillsEnv):
+        skill_dir = skills_env.skills_dir / "bad-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bad-skill\ndescription: bad\nbogus-field: value\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["validate"])
+
+        assert result.exit_code == 1, result.stdout
+        assert "bogus-field" in result.stdout
+        assert "fatal" in result.stdout.lower()
+
+
+class TestAddSameSkillIdWarningDisplay:
+    """Repeated skill_id across details must not hide or duplicate warnings."""
+
+    @staticmethod
+    def _make_local_source(tmp_path: Path, frontmatter: str, zip_frontmatter: str = "") -> Path:
+        import zipfile
+
+        source = tmp_path / "source"
+        _create_vendor_skill(source, "repeat-skill", frontmatter)
+        zip_extra = f"{zip_frontmatter}\n" if zip_frontmatter else ""
+        with zipfile.ZipFile(source / "repeat-skill.zip", "w") as archive:
+            archive.writestr(
+                "repeat-skill/SKILL.md",
+                f"---\nname: repeat-skill\ndescription: Zipped\n{zip_extra}---\nbody",
+            )
+        return source
+
+    @staticmethod
+    def _make_github_fixture(root: Path, path_frontmatter: dict[str, str]) -> Path:
+        prepared = root / "gh-tree"
+        for path_name, frontmatter in path_frontmatter.items():
+            skill_dir = prepared / path_name / "repeat-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: repeat-skill\ndescription: G\n{frontmatter}\n---\nbody",
+                encoding="utf-8",
+            )
+        return prepared
+
+    @staticmethod
+    def _install_github_fixture(
+        root: Path, path_frontmatter: dict[str, str], monkeypatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = TestAddSameSkillIdWarningDisplay._make_github_fixture(
+            root, path_frontmatter
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+    @staticmethod
+    def _clear_installed(skills_dir: Path, skill_id: str) -> None:
+        import shutil
+
+        installed = skills_dir / skill_id
+        if installed.exists():
+            shutil.rmtree(installed)
+
+    def test_local_then_same_id_zip_keeps_success_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        source = self._make_local_source(tmp_path, "model: sonnet", zip_frontmatter="icon: star")
+
+        human = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+
+        assert human.exit_code == 0, human.stdout
+        assert human.stdout.count("⚠") == 1
+        assert human.stdout.count("Claude Code") == 1
+        assert human.stdout.count("model") == 1
+        assert "Cursor" not in human.stdout
+        assert "icon" not in human.stdout
+        assert "Skipped" in human.stdout or "⊘" in human.stdout
+        assert (skills_env.skills_dir / "repeat-skill" / "SKILL.md").exists()
+
+        self._clear_installed(skills_env.skills_dir, "repeat-skill")
+
+        json_result = runner.invoke(app, ["add", str(source), "--no-keep-structure", "--json"])
+
+        assert json_result.exit_code == 0, json_result.stdout
+        data = json.loads(json_result.stdout)
+        success = [d for d in data["details"] if d["success"]]
+        skipped = [d for d in data["details"] if not d["success"]]
+        assert len(success) == 1
+        assert success[0]["skill_id"] == "repeat-skill"
+        warnings = success[0]["warnings"]
+        assert len(warnings) == 1
+        assert "model" in warnings[0]["message"]
+        assert "Claude Code" in warnings[0]["message"]
+        assert len(skipped) == 1
+        assert skipped[0]["skill_id"] == "repeat-skill"
+        assert skipped[0]["warnings"] == []
+
+    def test_local_then_same_id_zip_without_vendor_key_has_no_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        source = self._make_local_source(tmp_path, "license: MIT")
+
+        human = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+
+        assert human.exit_code == 0, human.stdout
+        assert "vendor-specific" not in human.stdout
+
+        self._clear_installed(skills_env.skills_dir, "repeat-skill")
+
+        json_result = runner.invoke(app, ["add", str(source), "--no-keep-structure", "--json"])
+
+        assert json_result.exit_code == 0, json_result.stdout
+        data = json.loads(json_result.stdout)
+        success = [d for d in data["details"] if d["success"]]
+        assert len(success) == 1
+        assert success[0]["warnings"] == []
+
+    def test_github_multi_path_same_id_keeps_first_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        path_frontmatter = {"path-a": "model: sonnet", "path-b": "icon: star"}
+        self._install_github_fixture(tmp_path / "run-human", path_frontmatter, monkeypatch)
+
+        human = runner.invoke(
+            app, ["add", "user/repo", "path-a", "path-b", "--no-keep-structure", "--yes"]
+        )
+
+        assert human.exit_code == 0, human.stdout
+        assert human.stdout.count("⚠") == 1
+        assert human.stdout.count("Claude Code") == 1
+        assert human.stdout.count("model") == 1
+        assert "Cursor" not in human.stdout
+        assert "icon" not in human.stdout
+
+        self._clear_installed(skills_env.skills_dir, "repeat-skill")
+        self._install_github_fixture(tmp_path / "run-json", path_frontmatter, monkeypatch)
+
+        json_result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "path-b", "--no-keep-structure", "--yes", "--json"],
+        )
+
+        assert json_result.exit_code == 0, json_result.stdout
+        data = json.loads(json_result.stdout)
+        success = [d for d in data["details"] if d["success"]]
+        skipped = [d for d in data["details"] if not d["success"]]
+        assert len(success) == 1
+        assert success[0]["skill_id"] == "repeat-skill"
+        warnings = success[0]["warnings"]
+        assert len(warnings) == 1
+        assert "model" in warnings[0]["message"]
+        assert "Claude Code" in warnings[0]["message"]
+        assert len(skipped) == 1
+        assert skipped[0]["warnings"] == []
+
+    def test_github_multi_path_same_id_without_vendor_key_has_no_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        path_frontmatter = {"path-a": "license: MIT", "path-b": "license: MIT"}
+        self._install_github_fixture(tmp_path / "run-human", path_frontmatter, monkeypatch)
+
+        human = runner.invoke(
+            app, ["add", "user/repo", "path-a", "path-b", "--no-keep-structure", "--yes"]
+        )
+
+        assert human.exit_code == 0, human.stdout
+        assert "vendor-specific" not in human.stdout
+
+        self._clear_installed(skills_env.skills_dir, "repeat-skill")
+        self._install_github_fixture(tmp_path / "run-json", path_frontmatter, monkeypatch)
+
+        json_result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "path-b", "--no-keep-structure", "--yes", "--json"],
+        )
+
+        assert json_result.exit_code == 0, json_result.stdout
+        data = json.loads(json_result.stdout)
+        success = [d for d in data["details"] if d["success"]]
+        assert len(success) == 1
+        assert success[0]["warnings"] == []
+
+    def test_local_and_zip_same_id_with_force_warns_once_per_success(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        source = self._make_local_source(tmp_path, "model: sonnet", zip_frontmatter="icon: star")
+
+        human = runner.invoke(app, ["add", str(source), "--no-keep-structure", "--force"])
+
+        assert human.exit_code == 0, human.stdout
+        assert human.stdout.count("Added 'repeat-skill'") == 2
+        assert human.stdout.count("⚠") == 2
+        warning_blocks = human.stdout.split("⚠")[1:]
+        claude_blocks = [
+            i for i, b in enumerate(warning_blocks) if "Claude Code" in b and "model" in b
+        ]
+        cursor_blocks = [i for i, b in enumerate(warning_blocks) if "Cursor" in b and "icon" in b]
+        assert len(claude_blocks) == 1
+        assert len(cursor_blocks) == 1
+        assert claude_blocks[0] != cursor_blocks[0]
+        assert (skills_env.skills_dir / "repeat-skill" / "SKILL.md").exists()
+
+        json_result = runner.invoke(
+            app, ["add", str(source), "--no-keep-structure", "--force", "--json"]
+        )
+
+        assert json_result.exit_code == 0, json_result.stdout
+        data = json.loads(json_result.stdout)
+        assert len(data["added"]) == 2
+        success = [d for d in data["details"] if d["success"]]
+        assert len(success) == 2
+        assert all(len(d["warnings"]) == 1 for d in success)
+
+    def test_github_multi_path_same_id_with_force_warns_once_per_success(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        path_frontmatter = {"path-a": "model: sonnet", "path-b": "icon: star"}
+        self._install_github_fixture(tmp_path / "run-human", path_frontmatter, monkeypatch)
+
+        human = runner.invoke(
+            app,
+            [
+                "add",
+                "user/repo",
+                "path-a",
+                "path-b",
+                "--no-keep-structure",
+                "--yes",
+                "--force",
+            ],
+        )
+
+        assert human.exit_code == 0, human.stdout
+        assert human.stdout.count("Added 'repeat-skill'") == 2
+        assert human.stdout.count("⚠") == 2
+        warning_blocks = human.stdout.split("⚠")[1:]
+        claude_blocks = [
+            i for i, b in enumerate(warning_blocks) if "Claude Code" in b and "model" in b
+        ]
+        cursor_blocks = [i for i, b in enumerate(warning_blocks) if "Cursor" in b and "icon" in b]
+        assert len(claude_blocks) == 1
+        assert len(cursor_blocks) == 1
+        assert claude_blocks[0] != cursor_blocks[0]
+
+        self._clear_installed(skills_env.skills_dir, "repeat-skill")
+        self._install_github_fixture(tmp_path / "run-json", path_frontmatter, monkeypatch)
+
+        json_result = runner.invoke(
+            app,
+            [
+                "add",
+                "user/repo",
+                "path-a",
+                "path-b",
+                "--no-keep-structure",
+                "--yes",
+                "--force",
+                "--json",
+            ],
+        )
+
+        assert json_result.exit_code == 0, json_result.stdout
+        data = json.loads(json_result.stdout)
+        assert len(data["added"]) == 2
+        success = [d for d in data["details"] if d["success"]]
+        assert len(success) == 2
+        assert all(len(d["warnings"]) == 1 for d in success)

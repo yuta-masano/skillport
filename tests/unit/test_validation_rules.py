@@ -1,7 +1,10 @@
 """Unit tests for skill validation rules (Agent Skills spec)."""
 
+from pathlib import Path
+
 import pytest
 
+from skillport.modules.skills.internal import validation
 from skillport.modules.skills.internal.validation import (
     ALLOWED_FRONTMATTER_KEYS,
     COMPATIBILITY_MAX_LENGTH,
@@ -11,6 +14,62 @@ from skillport.modules.skills.internal.validation import (
     SKILL_LINE_THRESHOLD,
     validate_skill_record,
 )
+from skillport.shared.utils import parse_frontmatter
+
+# Vendor registry contract from the task spec (order.md §3.1, §5.1).
+STANDARD_KEYS = frozenset(
+    {"name", "description", "license", "allowed-tools", "metadata", "compatibility"}
+)
+CLAUDE_CODE_KEYS = frozenset(
+    {
+        "when_to_use",
+        "argument-hint",
+        "arguments",
+        "disable-model-invocation",
+        "user-invocable",
+        "disallowed-tools",
+        "model",
+        "effort",
+        "context",
+        "agent",
+        "background",
+        "hooks",
+        "paths",
+        "shell",
+    }
+)
+CURSOR_KEYS = frozenset({"paths", "disable-model-invocation", "icon", "color", "globs"})
+VENDOR_KEYS = CLAUDE_CODE_KEYS | CURSOR_KEYS
+SHARED_KEYS = CLAUDE_CODE_KEYS & CURSOR_KEYS
+CLAUDE_ONLY_KEYS = CLAUDE_CODE_KEYS - CURSOR_KEYS
+CURSOR_ONLY_KEYS = CURSOR_KEYS - CLAUDE_CODE_KEYS
+
+
+def _write_skill_with_extra_keys(
+    tmp_path: Path, extra: dict[str, object], *, body: str = "# Body\n"
+) -> Path:
+    """Write a SKILL.md with the given extra top-level frontmatter keys."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    lines = ["name: my-skill", "description: A test skill"]
+    lines.extend(f"{key}: {value}" for key, value in extra.items())
+    (skill_dir / "SKILL.md").write_text(
+        "---\n" + "\n".join(lines) + "\n---\n" + body, encoding="utf-8"
+    )
+    return skill_dir
+
+
+def _validation_issues(
+    tmp_path: Path, extra: dict[str, object], *, strict: bool = False
+) -> list:
+    """Run validation over a skill with the given extra top-level keys."""
+    skill_dir = _write_skill_with_extra_keys(tmp_path, extra)
+    meta = {"name": "my-skill", "description": "A test skill", **extra}
+    return validate_skill_record(
+        {"name": "my-skill", "description": "A test skill", "path": str(skill_dir)},
+        strict=strict,
+        meta=meta,
+    )
 
 
 class TestValidationFatal:
@@ -583,19 +642,27 @@ class TestMetaKeyExistence:
 class TestStrictMode:
     """strict mode behavior tests."""
 
-    def test_strict_mode_filters_warnings(self):
-        """strict=True → only fatal issues returned."""
+    def test_strict_returns_non_fatal_warnings(self):
+        """strict=True → non-fatal warnings are still returned (for add result)."""
         issues = validate_skill_record(
             {
                 "name": "test",
                 "description": "desc",
                 "path": "/skills/test",
-                "lines": SKILL_LINE_THRESHOLD + 1,  # would be warning
+                "lines": SKILL_LINE_THRESHOLD + 1,  # warning
             },
             strict=True,
         )
-        # lines > 500 is a warning, should be filtered out
-        assert len(issues) == 0
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+
+    def test_strict_returns_vendor_warning(self, tmp_path: Path):
+        """strict=True → vendor key warning is returned so add can report it."""
+        issues = _validation_issues(tmp_path, {"model": "sonnet"}, strict=True)
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        assert "model" in warnings[0].message
+        assert "Claude Code" in warnings[0].message
 
     def test_strict_false_includes_warnings(self):
         """strict=False → all issues returned."""
@@ -696,3 +763,171 @@ compatibility:
         ]
         assert len(fatal) == 1
         assert "string" in fatal[0].message.lower()
+
+
+class TestVendorKeyRegistry:
+    """Allowed keys are the union of standard and vendor registries (order.md §3.1, §5.1)."""
+
+    def test_standard_key_set_is_six_keys(self):
+        assert set(validation.STANDARD_FRONTMATTER_KEYS) == set(STANDARD_KEYS)
+
+    def test_vendor_registry_contains_seventeen_keys(self):
+        assert set(validation.VENDOR_FRONTMATTER_KEYS) == set(VENDOR_KEYS)
+        assert len(set(validation.VENDOR_FRONTMATTER_KEYS)) == 17
+
+    def test_allowed_keys_are_standard_and_vendor_union(self):
+        assert set(ALLOWED_FRONTMATTER_KEYS) == set(STANDARD_KEYS) | set(VENDOR_KEYS)
+        assert len(set(ALLOWED_FRONTMATTER_KEYS)) == 23
+
+    def test_standard_and_vendor_keys_are_disjoint(self):
+        standard = set(validation.STANDARD_FRONTMATTER_KEYS)
+        assert standard & set(validation.VENDOR_FRONTMATTER_KEYS) == set()
+
+
+class TestVendorKeyWarning:
+    """Vendor keys are allowed with one aggregated warning per skill (order.md §4 Rule 2)."""
+
+    @pytest.mark.parametrize("key", sorted(VENDOR_KEYS))
+    def test_registered_vendor_key_is_not_fatal(self, tmp_path: Path, key: str):
+        issues = _validation_issues(tmp_path, {key: "value"})
+        assert [i for i in issues if i.severity == "fatal"] == []
+
+    @pytest.mark.parametrize("key", sorted(VENDOR_KEYS))
+    def test_registered_vendor_key_produces_one_warning(self, tmp_path: Path, key: str):
+        issues = _validation_issues(tmp_path, {key: "value"})
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        assert key in warnings[0].message
+
+    @pytest.mark.parametrize("key", sorted(CLAUDE_ONLY_KEYS))
+    def test_claude_code_only_key_reports_claude_code(self, tmp_path: Path, key: str):
+        issues = _validation_issues(tmp_path, {key: "value"})
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        assert "Claude Code" in warnings[0].message
+        assert "Cursor" not in warnings[0].message
+
+    @pytest.mark.parametrize("key", sorted(CURSOR_ONLY_KEYS))
+    def test_cursor_only_key_reports_cursor(self, tmp_path: Path, key: str):
+        issues = _validation_issues(tmp_path, {key: "value"})
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        assert "Cursor" in warnings[0].message
+        assert "Claude Code" not in warnings[0].message
+
+    @pytest.mark.parametrize("key", sorted(SHARED_KEYS))
+    def test_shared_key_reports_both_products(self, tmp_path: Path, key: str):
+        issues = _validation_issues(tmp_path, {key: "value"})
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        assert "Claude Code" in warnings[0].message
+        assert "Cursor" in warnings[0].message
+
+    def test_multiple_vendor_keys_aggregate_into_one_warning(self, tmp_path: Path):
+        issues = _validation_issues(tmp_path, {"model": "sonnet", "icon": "toolbox"})
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        message = warnings[0].message
+        assert "model" in message
+        assert "icon" in message
+        assert "Claude Code" in message
+        assert "Cursor" in message
+
+    def test_vendor_value_is_not_validated(self, tmp_path: Path):
+        issues = _validation_issues(tmp_path, {"hooks": "not-a-hook-mapping"})
+        assert [i for i in issues if i.severity == "fatal"] == []
+        warnings = [i for i in issues if i.severity == "warning"]
+        assert len(warnings) == 1
+        assert "hooks" in warnings[0].message
+        assert "Claude Code" in warnings[0].message
+
+    def test_vendor_key_names_outside_top_level_do_not_warn(self, tmp_path: Path):
+        """Vendor-looking names in metadata, body fences, or unrecognized delimiters stay unwarned."""
+        contents = {
+            "metadata-nested": (
+                "---\nname: metadata-nested\ndescription: desc\n"
+                "metadata:\n  model: sonnet\n---\n# Body\n"
+            ),
+            "body-fence": (
+                "---\nname: body-fence\ndescription: desc\n---\n"
+                "```yaml\nicon: toolbox\n```\n"
+            ),
+            "plus-delimiter": (
+                "+++\nname: plus-delimiter\ndescription: desc\nmodel: sonnet\n+++\n# Body\n"
+            ),
+            "unclosed-fence": (
+                "---\nname: unclosed-fence\ndescription: desc\nmodel: sonnet\n# Body\n"
+            ),
+        }
+        for label, content in contents.items():
+            skill_dir = tmp_path / label
+            skill_dir.mkdir()
+            skill_md = skill_dir / "SKILL.md"
+            skill_md.write_text(content, encoding="utf-8")
+            meta, _ = parse_frontmatter(skill_md)
+            issues = validate_skill_record(
+                {
+                    "name": meta.get("name", ""),
+                    "description": meta.get("description", ""),
+                    "path": str(skill_dir),
+                },
+                meta=meta,
+            )
+            vendor_warnings = [
+                i
+                for i in issues
+                if i.severity == "warning" and ("model" in i.message or "icon" in i.message)
+            ]
+            assert vendor_warnings == [], label
+
+        # Delimiter forms the parser does not recognize keep their required-key fatals.
+        for label in ("plus-delimiter", "unclosed-fence"):
+            skill_dir = tmp_path / label
+            meta, _ = parse_frontmatter(skill_dir / "SKILL.md")
+            issues = validate_skill_record(
+                {
+                    "name": meta.get("name", ""),
+                    "description": meta.get("description", ""),
+                    "path": str(skill_dir),
+                },
+                meta=meta,
+            )
+            missing = [i for i in issues if i.severity == "fatal" and "key is missing" in i.message]
+            assert len(missing) == 2, label
+
+
+class TestStandardKeyPreservation:
+    """Standard keys stay warning-free and unregistered keys stay fatal."""
+
+    def test_standard_keys_only_have_no_warning(self, tmp_path: Path):
+        issues = _validation_issues(
+            tmp_path,
+            {"license": "MIT", "allowed-tools": ["Read"], "compatibility": "Python 3.10+"},
+        )
+        assert [i for i in issues if i.severity == "warning"] == []
+        assert [i for i in issues if i.severity == "fatal"] == []
+
+    def test_unknown_top_level_key_stays_fatal(self, tmp_path: Path):
+        issues = _validation_issues(tmp_path, {"bogus-field": "value"})
+        fatal = [
+            i for i in issues if i.severity == "fatal" and "unexpected" in i.message.lower()
+        ]
+        assert len(fatal) == 1
+        assert "bogus-field" in fatal[0].message
+        assert [i for i in issues if i.severity == "warning"] == []
+
+    def test_unknown_key_inside_metadata_is_not_fatal(self, tmp_path: Path):
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: my-skill\ndescription: A test skill\n"
+            "metadata:\n  bogus-field: value\n---\n# Body\n",
+            encoding="utf-8",
+        )
+        meta, _ = parse_frontmatter(skill_md)
+        issues = validate_skill_record(
+            {"name": "my-skill", "description": "A test skill", "path": str(skill_dir)},
+            meta=meta,
+        )
+        assert [i for i in issues if i.severity == "fatal"] == []

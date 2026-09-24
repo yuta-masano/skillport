@@ -95,6 +95,10 @@ class AddResultItem(FrozenModel):
     skill_id: str
     success: bool
     message: str
+    warnings: list[ValidationIssue] = Field(
+        default_factory=list,
+        description="Non-fatal validation warnings for this skill",
+    )
 
 
 class AddResult(FrozenModel):

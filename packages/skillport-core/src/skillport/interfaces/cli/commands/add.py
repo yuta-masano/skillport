@@ -203,9 +203,18 @@ def _display_add_result(result: "AddResult", json_output: bool) -> int:  # noqa:
         return 1 if (not result.added and result.skipped) else 0
 
     # Human-readable output
+    details = getattr(result, "details", [])
     if result.added:
         for skill_id in result.added:
             console.print(f"[success]  ✓ Added '{skill_id}'[/success]")
+        # Warnings belong to successful details, not to the added ID list:
+        # the same ID can succeed more than once (e.g. --force), and each
+        # success carries its own warnings.
+        for detail in details:
+            if not detail.success:
+                continue
+            for warning in detail.warnings:
+                console.print(f"[warning]  ⚠ {detail.skill_id}: {warning.message}[/warning]")
     if result.skipped:
         for skill_id in result.skipped:
             detail_reason = next(

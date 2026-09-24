@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import stat
-import sys
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -14,9 +13,9 @@ from pathlib import Path
 
 import yaml
 
-from skillport.modules.skills.public.types import AddResult, RemoveResult
+from skillport.modules.skills.public.types import AddResult, AddResultItem, RemoveResult
 from skillport.shared.config import Config
-from skillport.shared.types import SourceType
+from skillport.shared.types import SourceType, ValidationIssue
 from skillport.shared.utils import (
     SymlinkPathError,
     checked_components,
@@ -831,7 +830,12 @@ def copy_skill_dir(source: Path, dest: Path, *, allow_symlinks: bool = False) ->
         shutil.rmtree(snapshot.parent, ignore_errors=True)
 
 
-def _validate_skill_file(skill_dir: Path) -> None:
+def _validate_skill_file(skill_dir: Path) -> list[ValidationIssue]:
+    """Validate SKILL.md and return its non-fatal warnings.
+
+    Raises:
+        ValueError: If a fatal validation issue is found.
+    """
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.exists():
         raise FileNotFoundError(f"SKILL.md not found: {skill_dir}")
@@ -868,18 +872,17 @@ def _validate_skill_file(skill_dir: Path) -> None:
         strict=True,
         meta=meta,
     )
-    # strict=True returns only fatal issues
-    if issues:
-        raise ValueError("; ".join([i.message for i in issues]))
-    # Warnings printed but non-fatal
-    for issue in issues:
-        if issue.severity != "fatal":
-            print(f"[WARN] {skill_dir}: {issue.message}", file=sys.stderr)
+    # strict=True keeps fatal and warning issues; only fatal blocks the add
+    fatal = [i for i in issues if i.severity == "fatal"]
+    if fatal:
+        raise ValueError("; ".join([i.message for i in fatal]))
 
     if name != skill_dir.name:
         raise ValueError(
             f"Invalid SKILL.md in {skill_dir}: name '{name}' must match directory '{skill_dir.name}'"
         )
+
+    return [i for i in issues if i.severity != "fatal"]
 
 
 def add_builtin(name: str, *, config: Config, force: bool) -> AddResult:
@@ -920,11 +923,11 @@ def add_local(
     namespace_override: str | None = None,
     rename_single_to: str | None = None,
     allow_symlinks: bool = False,
-) -> list[AddResult]:
+) -> list[AddResultItem]:
     target_root = config.skills_dir
     target_root.mkdir(parents=True, exist_ok=True)
 
-    results: list[AddResult] = []
+    results: list[AddResultItem] = []
     namespace = namespace_override or safe_basename(source_path)
     seen_ids: set[str] = set()
 
@@ -935,7 +938,7 @@ def add_local(
                 skill_name = rename_single_to
             skill_id = skill_name if not keep_structure else f"{namespace}/{skill_name}"
             results.append(
-                AddResult(
+                AddResultItem(
                     success=False,
                     skill_id=skill_id,
                     message=skill.error,
@@ -947,9 +950,10 @@ def add_local(
         skill_name = rename_single_to if rename_single_to and len(skills) == 1 else skill.name
         skill_id = skill_name if not keep_structure else f"{namespace}/{skill_name}"
         dest: Path | None = None
+        warnings: list[ValidationIssue] = []
         try:
             snapshot = snapshot_skill_dir(skill.source_path, allow_symlinks=allow_symlinks)
-            _validate_skill_file(snapshot)
+            warnings = _validate_skill_file(snapshot)
 
             if skill_id in seen_ids:
                 raise ValueError(f"Duplicate skill id detected: {skill_id}")
@@ -959,7 +963,7 @@ def add_local(
             if dest.exists():
                 if not force:
                     results.append(
-                        AddResult(
+                        AddResultItem(
                             success=False,
                             skill_id=skill_id,
                             message=f"Skill '{skill_id}' exists.",
@@ -985,13 +989,18 @@ def add_local(
                         ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
                     )
             results.append(
-                AddResult(success=True, skill_id=skill_id, message=f"Added '{skill_id}'")
+                AddResultItem(
+                    success=True,
+                    skill_id=skill_id,
+                    message=f"Added '{skill_id}'",
+                    warnings=warnings,
+                )
             )
         except Exception as exc:
             if dest is not None and dest.exists():
                 shutil.rmtree(dest, ignore_errors=True)
             results.append(
-                AddResult(
+                AddResultItem(
                     success=False,
                     skill_id=skill_id,
                     message=f"Failed to add '{skill_id}': {exc}",

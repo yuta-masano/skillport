@@ -34,7 +34,8 @@ def validate_skill(
 
     Args:
         skill: Skill summary or dict to validate.
-        strict: If True, only fatal issues are returned.
+        strict: If True, informational issues are omitted. Fatal and warning
+            issues are returned either way.
 
     Returns:
         ValidationResult with valid flag, issues, and skill_id.

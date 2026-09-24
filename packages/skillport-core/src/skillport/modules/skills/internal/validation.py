@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 
 from skillport.shared.types import ValidationIssue
@@ -52,21 +53,87 @@ def _contains_xml_tags(text: str) -> bool:
 
 
 # Allowed top-level frontmatter properties
-ALLOWED_FRONTMATTER_KEYS: set[str] = {
-    # agentskills.io specification
-    "name",
-    "description",
-    "license",
-    "allowed-tools",
-    "metadata",
-    "compatibility",
-    # Claude Code 2.1.0+ runtime fields
-    "model",
-    "context",
-    "agent",
-    "hooks",
-    "user-invocable",
+# Standard keys are validated by value; vendor keys are accepted as known
+# product extensions and only reported as a warning.
+STANDARD_FRONTMATTER_KEYS: frozenset[str] = frozenset(
+    {
+        # agentskills.io specification
+        "name",
+        "description",
+        "license",
+        "allowed-tools",
+        "metadata",
+        "compatibility",
+    }
+)
+
+CLAUDE_CODE_PRODUCT = "Claude Code"
+CURSOR_PRODUCT = "Cursor"
+
+_CLAUDE_CODE_SKILLS_DOC = "https://code.claude.com/docs/en/skills"
+_CURSOR_SKILLS_DOC = "https://cursor.com/docs/skills"
+
+
+@dataclass(frozen=True)
+class VendorKeySource:
+    """Primary source and confirmed version for one product's frontmatter field."""
+
+    product: str
+    url: str
+    version: str
+
+
+# Product-specific top-level keys, each mapped to the products that define it.
+# The values are owned by each product and are deliberately not validated here.
+# Keys with no confirmed product source (Codex, GitHub Copilot, Gemini CLI,
+# Google Antigravity) are not registered.
+VENDOR_FRONTMATTER_KEYS: dict[str, tuple[VendorKeySource, ...]] = {
+    "when_to_use": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "argument-hint": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "arguments": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "disable-model-invocation": (
+        VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),
+        VendorKeySource(CURSOR_PRODUCT, _CURSOR_SKILLS_DOC, "未確認"),
+    ),
+    "user-invocable": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "disallowed-tools": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "model": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "effort": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "context": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "agent": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "background": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "2.1.218+"),),
+    "hooks": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "paths": (
+        VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),
+        VendorKeySource(CURSOR_PRODUCT, _CURSOR_SKILLS_DOC, "未確認"),
+    ),
+    "shell": (VendorKeySource(CLAUDE_CODE_PRODUCT, _CLAUDE_CODE_SKILLS_DOC, "未確認"),),
+    "icon": (VendorKeySource(CURSOR_PRODUCT, _CURSOR_SKILLS_DOC, "未確認"),),
+    "color": (VendorKeySource(CURSOR_PRODUCT, _CURSOR_SKILLS_DOC, "未確認"),),
+    "globs": (VendorKeySource(CURSOR_PRODUCT, _CURSOR_SKILLS_DOC, "未確認"),),
 }
+
+ALLOWED_FRONTMATTER_KEYS: set[str] = set(STANDARD_FRONTMATTER_KEYS) | set(VENDOR_FRONTMATTER_KEYS)
+
+
+def _build_vendor_warning(vendor_keys: list[str]) -> ValidationIssue:
+    """Build one aggregated warning for the vendor keys used by a skill."""
+    used = set(vendor_keys)
+    products: list[str] = []
+    for key, sources in VENDOR_FRONTMATTER_KEYS.items():
+        if key not in used:
+            continue
+        for source in sources:
+            if source.product not in products:
+                products.append(source.product)
+    return ValidationIssue(
+        severity="warning",
+        message=(
+            f"frontmatter: vendor-specific field(s) for {', '.join(products)}: "
+            f"{', '.join(vendor_keys)}"
+        ),
+        field="frontmatter",
+    )
 
 
 def validate_skill_record(
@@ -79,7 +146,9 @@ def validate_skill_record(
 
     Args:
         skill: Skill data dict (name, description, lines, path).
-        strict: If True, return only fatal issues. Used by add command.
+        strict: If True, informational issues are omitted. Fatal and warning
+                issues are returned either way, so callers can report
+                non-fatal warnings along with the validation result.
         meta: Raw frontmatter dict from parse_frontmatter(). If provided,
               enables key existence checks (A1/A2). Used by add command.
 
@@ -253,6 +322,10 @@ def validate_skill_record(
                                 field="frontmatter",
                             )
                         )
+                    # Registered vendor keys → one aggregated warning
+                    vendor_keys = sorted(set(parsed_meta.keys()) & set(VENDOR_FRONTMATTER_KEYS))
+                    if vendor_keys:
+                        issues.append(_build_vendor_warning(vendor_keys))
                     # Compatibility validation (optional, max 500 chars, string type)
                     compatibility = parsed_meta.get("compatibility")
                     if compatibility is not None:
@@ -275,7 +348,8 @@ def validate_skill_record(
             except Exception:
                 pass  # Skip if file cannot be parsed
 
-    # strict mode: return only fatal issues
+    # strict mode: informational issues are dropped; fatal and warning issues
+    # stay so callers such as add can report non-fatal warnings with the result
     if strict:
-        return [i for i in issues if i.severity == "fatal"]
+        return [i for i in issues if i.severity != "info"]
     return issues

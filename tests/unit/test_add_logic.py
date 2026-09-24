@@ -60,6 +60,19 @@ def _create_skill(path: Path, name: str, description: str = "Test description") 
     return skill_dir
 
 
+def _create_skill_with_frontmatter(
+    path: Path, name: str, frontmatter: str, *, body: str = "Body content"
+) -> Path:
+    """Helper to create a skill directory with extra top-level frontmatter keys."""
+    skill_dir = path / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Test description\n{frontmatter}\n---\n{body}",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
 class TestDetectSkills:
     """Skill detection tests."""
 
@@ -2880,3 +2893,127 @@ class TestNoFollowUnsupportedPlatform:
 
         assert result.success, result.message
         assert (skills_dir / "skill" / "linked.txt").read_text(encoding="utf-8") == "hard"
+
+
+class TestAddLocalVendorWarnings:
+    """Successful adds carry non-fatal warnings; failures and skips do not."""
+
+    def test_successful_add_carries_vendor_warning(self, tmp_path: Path):
+        source = tmp_path / "source"
+        _create_skill_with_frontmatter(source, "skill-a", "model: sonnet\nicon: toolbox")
+        results = add_local(
+            source_path=source,
+            skills=detect_skills(source),
+            config=Config(skills_dir=tmp_path / "target"),
+            keep_structure=False,
+            force=False,
+        )
+
+        assert len(results) == 1
+        assert results[0].success, results[0].message
+        warnings = [w for w in results[0].warnings if w.severity == "warning"]
+        assert len(warnings) == 1
+        message = warnings[0].message
+        assert "model" in message
+        assert "icon" in message
+        assert "Claude Code" in message
+        assert "Cursor" in message
+
+    def test_failed_add_carries_no_warnings(self, tmp_path: Path):
+        source = tmp_path / "source"
+        _create_skill_with_frontmatter(source, "bad-skill", "bogus-field: value")
+        results = add_local(
+            source_path=source,
+            skills=detect_skills(source),
+            config=Config(skills_dir=tmp_path / "target"),
+            keep_structure=False,
+            force=False,
+        )
+
+        assert len(results) == 1
+        assert not results[0].success
+        assert results[0].warnings == []
+
+    def test_skipped_existing_skill_carries_no_warnings(self, tmp_path: Path):
+        source = tmp_path / "source"
+        _create_skill_with_frontmatter(source, "skill-a", "model: sonnet")
+        target = tmp_path / "target"
+        _create_skill(target, "skill-a")
+
+        results = add_local(
+            source_path=source,
+            skills=detect_skills(source),
+            config=Config(skills_dir=target),
+            keep_structure=False,
+            force=False,
+        )
+
+        assert len(results) == 1
+        assert not results[0].success
+        assert results[0].warnings == []
+
+    def test_standard_only_skill_carries_no_warnings(self, tmp_path: Path):
+        source = tmp_path / "source"
+        _create_skill(source, "skill-a")
+        results = add_local(
+            source_path=source,
+            skills=detect_skills(source),
+            config=Config(skills_dir=tmp_path / "target"),
+            keep_structure=False,
+            force=False,
+        )
+
+        assert results[0].success, results[0].message
+        assert results[0].warnings == []
+
+    def test_line_count_warning_is_carried(self, tmp_path: Path):
+        source = tmp_path / "source"
+        body = "\n".join(["line"] * 501)
+        _create_skill_with_frontmatter(source, "skill-a", "", body=body)
+        results = add_local(
+            source_path=source,
+            skills=detect_skills(source),
+            config=Config(skills_dir=tmp_path / "target"),
+            keep_structure=False,
+            force=False,
+        )
+
+        assert results[0].success, results[0].message
+        assert any("lines" in w.message.lower() for w in results[0].warnings)
+
+
+class TestAddSkillVendorWarningPropagation:
+    """Public add result forwards per-skill warnings to its details (order.md §3.3)."""
+
+    def test_success_detail_carries_warning(self, tmp_path: Path):
+        from skillport.modules.skills import add_skill
+
+        source = tmp_path / "source"
+        _create_skill_with_frontmatter(source, "vendor-skill", "model: sonnet")
+        cfg = Config(skills_dir=tmp_path / "installed", db_path=tmp_path / "db.lancedb")
+
+        result = add_skill(str(source), config=cfg, force=False, keep_structure=False)
+
+        assert result.success, result.message
+        assert len(result.details) == 1
+        assert result.details[0].success
+        warnings = result.details[0].warnings
+        assert len(warnings) == 1
+        assert "model" in warnings[0].message
+        assert "Claude Code" in warnings[0].message
+        assert "warnings" not in result.model_dump()
+
+    def test_failed_detail_carries_no_warning(self, tmp_path: Path):
+        from skillport.modules.skills import add_skill
+
+        source = tmp_path / "source"
+        _create_skill_with_frontmatter(source, "bad-skill", "bogus-field: value")
+        cfg = Config(skills_dir=tmp_path / "installed", db_path=tmp_path / "db.lancedb")
+
+        result = add_skill(str(source), config=cfg, force=False, keep_structure=False)
+
+        assert not result.success
+        assert len(result.details) == 1
+        assert not result.details[0].success
+        assert result.details[0].warnings == []
+        assert "warnings" not in result.model_dump()

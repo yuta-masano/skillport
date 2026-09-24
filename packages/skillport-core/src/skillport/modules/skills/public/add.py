@@ -297,7 +297,13 @@ def _process_directory_skills(
     )
 
     ctx.details = [
-        AddResultItem(skill_id=r.skill_id, success=r.success, message=r.message) for r in results
+        AddResultItem(
+            skill_id=r.skill_id,
+            success=r.success,
+            message=r.message,
+            warnings=r.warnings,
+        )
+        for r in results
     ]
     ctx.added_ids = [r.skill_id for r in results if r.success]
     ctx.skipped_ids = [r.skill_id for r in results if not r.success]
