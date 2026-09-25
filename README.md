@@ -1,3 +1,6 @@
+> [!IMPORTANT]  
+> **This is a personal fork of [gotalab/skillport](https://github.com/gotalab/skillport)** with custom modifications for personal use.
+
 # ⚓ SkillPort
 
 <div align="center">
