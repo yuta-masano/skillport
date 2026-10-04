@@ -325,7 +325,7 @@ uv tool install .
 uv tool install ./packages/skillport-mcp
 
 # Reinstall over an existing installation
-uv tool install --force .
+uv tool install --force --refresh .
 
 # Track local code changes without reinstalling
 uv tool install --editable ./packages/skillport-mcp
