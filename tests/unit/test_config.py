@@ -1,5 +1,6 @@
 """Unit tests for Config class (SPEC2-CLI Section 4.2)."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ class TestConfigDefaults:
     def test_meta_dir_default(self, monkeypatch):
         """meta_dir defaults to db_path parent / meta."""
         monkeypatch.delenv("SKILLPORT_DB_PATH", raising=False)
+        monkeypatch.delenv("SKILLPORT_META_DIR", raising=False)
         cfg = Config()
         assert cfg.meta_dir == SKILLPORT_HOME / "indexes" / "default" / "meta"
 
@@ -59,6 +61,7 @@ class TestConfigEnvironment:
     def test_db_path_from_env(self, monkeypatch, tmp_path):
         """SKILLPORT_DB_PATH loaded from environment."""
         monkeypatch.setenv("SKILLPORT_DB_PATH", str(tmp_path / "custom.lancedb"))
+        monkeypatch.delenv("SKILLPORT_META_DIR", raising=False)
         cfg = Config()
         assert cfg.db_path == tmp_path / "custom.lancedb"
         # meta_dir should follow explicit db_path
@@ -95,6 +98,7 @@ class TestConfigAutoPaths:
 
     def test_custom_skills_dir_derives_db_and_meta(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SKILLPORT_DB_PATH", raising=False)
+        monkeypatch.delenv("SKILLPORT_META_DIR", raising=False)
         custom = tmp_path / "custom-skills"
         cfg = Config(skills_dir=custom)
         # slug-based directory (10 hex chars)
@@ -102,6 +106,19 @@ class TestConfigAutoPaths:
         assert len(slug) == 10 or slug == "default"
         assert cfg.db_path.name == "skills.lancedb"
         assert cfg.meta_dir == cfg.db_path.parent / "meta"
+
+
+class TestConfigUnitIsolation:
+    """Unit tests run with paths isolated from ~/.skillport/indexes."""
+
+    def test_fixture_isolates_db_and_meta_paths(self, tmp_path):
+        """The autouse fixture points db/meta env vars at the unit-test tmp_path."""
+        assert os.environ["SKILLPORT_DB_PATH"] == str(tmp_path / "index" / "skills.lancedb")
+        assert os.environ["SKILLPORT_META_DIR"] == str(tmp_path / "index" / "meta")
+
+        cfg = Config()
+        assert cfg.db_path == tmp_path / "index" / "skills.lancedb"
+        assert cfg.meta_dir == tmp_path / "index" / "meta"
 
 
 class TestConfigFilters:
