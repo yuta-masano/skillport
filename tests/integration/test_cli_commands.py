@@ -1495,6 +1495,937 @@ class TestVendorFrontmatterWarningsCli:
         assert not (skills_env.skills_dir / "vendor-skill").exists()
 
 
+class TestAllowXmlTagsCli:
+    """--allow-xml-tags demotes XML tag violations to warnings (order.md §6)."""
+
+    @staticmethod
+    def _create_frontmatter_xml_skill(root: Path, name: str) -> Path:
+        skill_dir = root / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f'---\nname: {name}\ndescription: "Use when the user says <person>"\n---\n# {name}\n',
+            encoding="utf-8",
+        )
+        return skill_dir
+
+    @staticmethod
+    def _create_body_xml_skill(root: Path, name: str) -> Path:
+        skill_dir = root / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Plain text\n---\nUse when the user says <person>.\n",
+            encoding="utf-8",
+        )
+        return skill_dir
+
+    def test_add_help_lists_allow_xml_tags(self, skills_env: SkillsEnv):
+        """add --help documents the --allow-xml-tags option and its danger notice."""
+        result = runner.invoke(app, ["add", "--help"])
+
+        assert result.exit_code == 0
+        assert "--allow-xml-tags" in result.stdout
+
+        lines = result.stdout.splitlines()
+        start = next(i for i, line in enumerate(lines) if "--allow-xml-tags" in line)
+        option_help = [lines[start]]
+        for line in lines[start + 1 :]:
+            if line.lstrip("│ ").startswith("--"):
+                break
+            option_help.append(line)
+
+        assert "dangerous" in "\n".join(option_help)
+
+    def test_add_without_flag_rejects_xml_tag_skill(self, skills_env: SkillsEnv, tmp_path: Path):
+        """Flagless add of a name/description XML tag skill fails and installs nothing."""
+        source = self._create_frontmatter_xml_skill(tmp_path / "source", "<person>")
+
+        result = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+
+        assert result.exit_code == 1, result.stdout
+        assert "cannot contain XML tags" in result.stdout
+        assert not (skills_env.skills_dir / "<person>").exists()
+
+    def test_add_with_flag_installs_name_and_description_xml_tags(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """--allow-xml-tags installs name/description XML tags and warns for both."""
+        source = self._create_frontmatter_xml_skill(tmp_path / "source", "<person>")
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert "frontmatter.description: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+
+    def test_add_with_flag_rejects_invalid_name_char_outside_xml_tag(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """Invalid characters outside the XML tag stay fatal under the flag."""
+        source = tmp_path / "source"
+        skill_dir = source / "my_name<person>"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: "my_name<person>"\ndescription: "Plain text"\n---\nbody',
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 1, result.stdout
+        assert "invalid chars" in result.stdout
+        assert not (skills_env.skills_dir / "my_name<person>").exists()
+
+    @pytest.mark.parametrize(
+        "name",
+        ['<person key="x">', '<person key="\x1b">', '<person key="\x07">'],
+        ids=["attribute", "esc", "bel"],
+    )
+    def test_add_with_flag_json_rejects_invalid_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, name: str
+    ):
+        """Tag-internal invalid name chars stay fatal and are not reported as added."""
+        source = tmp_path / "source"
+        skill_dir = source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure", "--json"]
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["details"][0]["success"] is False
+        assert "invalid chars" in data["details"][0]["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_with_flag_rejects_name_with_path_separator(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A name with path separators is rejected before it can pick a destination."""
+        source = tmp_path / "source"
+        skill_dir = source / "escape>"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: "<person/../../escape>"\ndescription: "Plain text"\n---\nbody',
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 1, result.stdout
+        assert "doesn't match directory" in result.stdout
+        assert not (skills_env.skills_dir.parent / "escape>").exists()
+
+    def test_add_with_flag_installs_and_warns(self, skills_env: SkillsEnv, tmp_path: Path):
+        """--allow-xml-tags installs the skill and reports the XML warning."""
+        source = self._create_frontmatter_xml_skill(tmp_path / "source", "xml-skill")
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added 'xml-skill'" in result.stdout
+        warning_text = result.stdout.split("⚠", 1)[1]
+        assert "xml-skill:" in warning_text
+        assert "cannot contain XML tags" in warning_text
+        assert (skills_env.skills_dir / "xml-skill" / "SKILL.md").exists()
+
+    def test_add_with_flag_json_reports_warning(self, skills_env: SkillsEnv, tmp_path: Path):
+        """--json carries the demoted XML issue as a per-skill warning."""
+        source = self._create_frontmatter_xml_skill(tmp_path / "source", "xml-skill")
+
+        result = runner.invoke(
+            app,
+            ["add", str(source), "--allow-xml-tags", "--no-keep-structure", "--json"],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert len(data["details"]) == 1
+        detail = data["details"][0]
+        assert detail["success"] is True
+        assert len(detail["warnings"]) == 1
+        warning = detail["warnings"][0]
+        assert warning["severity"] == "warning"
+        assert warning["field"] == "description"
+        assert warning["message"] == "frontmatter.description: cannot contain XML tags"
+
+    def test_add_with_flag_keeps_other_fatal_rejected(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """Other fatal rules stay fatal when --allow-xml-tags is given."""
+        source = tmp_path / "source"
+        skill_dir = source / "mixed-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: mixed-skill\ndescription: "Use <person>"\nbogus-field: value\n---\nbody',
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app, ["add", str(skill_dir), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 1, result.stdout
+        assert "unexpected field" in result.stdout
+        assert not (skills_env.skills_dir / "mixed-skill").exists()
+
+    def test_flag_is_not_persisted_between_invocations(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A flagged add does not weaken the next flagless add."""
+        first_source = self._create_frontmatter_xml_skill(tmp_path / "first", "first-xml-skill")
+        second_source = self._create_frontmatter_xml_skill(
+            tmp_path / "second", "second-xml-skill"
+        )
+
+        first = runner.invoke(
+            app, ["add", str(first_source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+        assert first.exit_code == 0, first.stdout
+
+        second = runner.invoke(app, ["add", str(second_source), "--no-keep-structure"])
+
+        assert second.exit_code == 1, second.stdout
+        assert "cannot contain XML tags" in second.stdout
+        assert (skills_env.skills_dir / "first-xml-skill" / "SKILL.md").exists()
+        assert not (skills_env.skills_dir / "second-xml-skill").exists()
+
+    def test_add_body_only_xml_without_flag_installs(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """XML tags outside the frontmatter are not XML tag violations."""
+        source = self._create_body_xml_skill(tmp_path / "source", "body-skill")
+
+        result = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+
+        assert result.exit_code == 0, result.stdout
+        assert (skills_env.skills_dir / "body-skill" / "SKILL.md").exists()
+
+    def test_add_body_only_xml_with_flag_has_no_xml_warning(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A body-only XML tag produces no warning even with the flag."""
+        source = self._create_body_xml_skill(tmp_path / "source", "body-skill")
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "cannot contain XML tags" not in result.stdout
+        assert (skills_env.skills_dir / "body-skill" / "SKILL.md").exists()
+
+    def test_validate_reports_xml_fatal_after_flagged_add(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """validate always reports the name/description XML tag violation as fatal."""
+        source = self._create_frontmatter_xml_skill(tmp_path / "source", "<person>")
+        added = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+        assert added.exit_code == 0, added.stdout
+
+        result = runner.invoke(app, ["validate"])
+
+        assert result.exit_code == 1, result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert "frontmatter.description: cannot contain XML tags" in result.stdout
+        assert "fatal" in result.stdout.lower()
+
+    def test_validate_body_only_xml_is_not_fatal(self, skills_env: SkillsEnv, tmp_path: Path):
+        """validate does not report body-only XML tags as fatal."""
+        source = self._create_body_xml_skill(tmp_path / "source", "body-skill")
+        added = runner.invoke(app, ["add", str(source), "--no-keep-structure"])
+        assert added.exit_code == 0, added.stdout
+
+        result = runner.invoke(app, ["validate", "body-skill"])
+
+        assert result.exit_code == 0, result.stdout
+        assert "cannot contain XML tags" not in result.stdout
+
+    def test_add_with_flag_propagates_to_nested_zip(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """The flag reaches the recursive add_skill call for nested ZIP files."""
+        import zipfile
+
+        source = tmp_path / "bundle"
+        source.mkdir()
+        with zipfile.ZipFile(source / "inner.zip", "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                '---\nname: inner-skill\ndescription: "Use <person>"\n---\nbody',
+            )
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"]
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added 'inner-skill'" in result.stdout
+        assert "cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "inner-skill" / "SKILL.md").exists()
+
+    def test_add_with_flag_installs_tag_name_from_nested_zip(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A bare tag name from a nested ZIP is installed with warnings."""
+        import zipfile
+
+        source = tmp_path / "bundle"
+        source.mkdir()
+        with zipfile.ZipFile(source / "inner.zip", "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                '---\nname: "<person>"\ndescription: "Use <person>"\n---\nbody',
+            )
+
+        result = runner.invoke(app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"])
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert "frontmatter.description: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+
+    def test_add_with_flag_rejects_invalid_tag_name_from_nested_zip(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A rejected tag name from a nested ZIP is not reported as added."""
+        import zipfile
+
+        name = '<person key="x">'
+        source = tmp_path / "bundle"
+        source.mkdir()
+        with zipfile.ZipFile(source / "inner.zip", "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            )
+
+        result = runner.invoke(
+            app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure", "--json"]
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["details"][0]["success"] is False
+        assert "invalid chars" in data["details"][0]["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_github_multi_path_with_flag_propagates(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The flag reaches the add_skill call for GitHub multi-path sources."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        skill_dir = prepared / "path-a" / "gh-xml-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: gh-xml-skill\ndescription: "Use <person>"\n---\nbody',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "--allow-xml-tags", "--no-keep-structure", "--yes"],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added 'gh-xml-skill'" in result.stdout
+        assert "cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "gh-xml-skill" / "SKILL.md").exists()
+
+    def test_add_github_multi_path_with_flag_installs_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """A bare tag name is installed with warnings through the multi-path route."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        skill_dir = prepared / "path-a" / "<person>"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: "<person>"\ndescription: "Use <person>"\n---\nbody',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "--allow-xml-tags", "--no-keep-structure", "--yes"],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+
+    def test_add_github_multi_path_with_flag_rejects_invalid_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """A rejected tag name is not aggregated into the added IDs."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        name = '<person key="x">'
+        skill_dir = prepared / "path-a" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "user/repo",
+                "path-a",
+                "--allow-xml-tags",
+                "--no-keep-structure",
+                "--yes",
+                "--json",
+            ],
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["details"][0]["success"] is False
+        assert "invalid chars" in data["details"][0]["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_with_flag_rejects_tag_name_with_trailing_hyphen(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A tag name ending with a hyphen stays fatal under --allow-xml-tags."""
+        name = "<person->"
+        source = tmp_path / "source"
+        skill_dir = source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"])
+
+        assert result.exit_code == 1, result.stdout
+        assert "start or end with hyphen" in " ".join(result.stdout.split())
+        assert "✓ Added" not in result.stdout
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_with_flag_json_rejects_tag_name_with_trailing_hyphen(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """The rejected tag name ending with a hyphen is not in the added IDs."""
+        name = "<person->"
+        source = tmp_path / "source"
+        skill_dir = source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", str(source), "--allow-xml-tags", "--no-keep-structure", "--json"],
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["details"][0]["success"] is False
+        assert "start or end with hyphen" in data["details"][0]["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_with_flag_rejects_tag_name_trailing_hyphen_from_nested_zip(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A rejected trailing-hyphen tag name from a nested ZIP is not added."""
+        import zipfile
+
+        name = "<person->"
+        source = tmp_path / "bundle"
+        source.mkdir()
+        with zipfile.ZipFile(source / "inner.zip", "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            )
+
+        result = runner.invoke(
+            app,
+            ["add", str(source), "--allow-xml-tags", "--no-keep-structure", "--json"],
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["details"][0]["success"] is False
+        assert "start or end with hyphen" in data["details"][0]["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_github_multi_path_with_flag_rejects_tag_name_trailing_hyphen(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """A rejected trailing-hyphen tag name is not aggregated into added IDs."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        name = "<person->"
+        prepared = tmp_path / "gh-tree"
+        skill_dir = prepared / "path-a" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "user/repo",
+                "path-a",
+                "--allow-xml-tags",
+                "--no-keep-structure",
+                "--yes",
+                "--json",
+            ],
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["details"][0]["success"] is False
+        assert "start or end with hyphen" in data["details"][0]["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_human_output_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """A rejected ESC-bearing name is displayed with visible escapes, not raw."""
+        name = "<person\x1b>"
+        source = tmp_path / "source"
+        skill_dir = source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"])
+
+        assert result.exit_code == 1, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        assert "invalid chars" in " ".join(result.stdout.split())
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_github_multi_path_human_output_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The multi-path human output escapes a control character in the name."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        name = "<person\x1b>"
+        prepared = tmp_path / "gh-tree"
+        skill_dir = prepared / "path-a" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "--allow-xml-tags", "--no-keep-structure", "--yes"],
+        )
+
+        assert result.exit_code == 1, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_nested_zip_human_output_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """The nested-ZIP human output escapes a control character in the name."""
+        import zipfile
+
+        name = "<person\x1b>"
+        source = tmp_path / "bundle"
+        source.mkdir()
+        with zipfile.ZipFile(source / "inner.zip", "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            )
+
+        result = runner.invoke(app, ["add", str(source), "--allow-xml-tags", "--no-keep-structure"])
+
+        assert result.exit_code == 1, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_json_preserves_control_char_name_values(
+        self, skills_env: SkillsEnv, tmp_path: Path
+    ):
+        """The JSON result keeps the raw rejected name and detail message."""
+        name = "<person\x1b>"
+        source = tmp_path / "source"
+        skill_dir = source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app,
+            ["add", str(source), "--allow-xml-tags", "--no-keep-structure", "--json"],
+        )
+
+        assert result.exit_code == 1, result.stdout
+        data = json.loads(result.stdout)
+        assert data["added"] == []
+        assert data["skipped"] == [name]
+        detail = data["details"][0]
+        assert detail["success"] is False
+        assert detail["skill_id"] == name
+        assert name in detail["message"]
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_interactive_prompt_shows_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The interactive prompt shows a normal tag name and installs it with a warning."""
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        source = self._create_frontmatter_xml_skill(tmp_path / "source", "<person>")
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(app, ["add", str(source), "--allow-xml-tags"], input="1\n")
+
+        assert result.exit_code == 0, result.stdout
+        assert "Found 1 skill(s): <person>" in result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+
+    def test_add_interactive_prompt_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The interactive prompt escapes a control character in the name."""
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        name = "<person\x1b>"
+        source = tmp_path / "source"
+        skill_dir = source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(app, ["add", str(source), "--allow-xml-tags"], input="1\n")
+
+        assert result.exit_code == 1, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        prompt_area = result.stdout.split("Where to add?", 1)[0]
+        assert "<person\\x1b>" in prompt_area
+        assert "invalid chars" in " ".join(result.stdout.split())
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_url_interactive_prompt_shows_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The URL flow shows a normal tag name in the prompt and installs it."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        skill_dir = prepared / "<person>"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: "<person>"\ndescription: "Use <person>"\n---\nbody',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(
+            app, ["add", "https://github.com/user/repo", "--allow-xml-tags"], input="1\n"
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Found 1 skill(s): <person>" in result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+
+    def test_add_url_interactive_prompt_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The URL flow escapes a control character in the prompt and skips the skill."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        name = "<person\x1b>"
+        prepared = tmp_path / "gh-tree"
+        skill_dir = prepared / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(
+            app, ["add", "https://github.com/user/repo", "--allow-xml-tags"], input="1\n"
+        )
+
+        assert result.exit_code == 1, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        prompt_area = result.stdout.split("Where to add?", 1)[0]
+        assert "<person\\x1b>" in prompt_area
+        assert "invalid chars" in " ".join(result.stdout.split())
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_zip_interactive_prompt_shows_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The direct ZIP flow shows a normal tag name in the prompt and installs it."""
+        import zipfile
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        zip_path = tmp_path / "tag.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                '---\nname: "<person>"\ndescription: "Use <person>"\n---\nbody',
+            )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(app, ["add", str(zip_path), "--allow-xml-tags"], input="1\n")
+
+        assert result.exit_code == 0, result.stdout
+        assert "Found 1 skill(s): <person>" in result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+
+    def test_add_zip_interactive_prompt_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The direct ZIP flow escapes a control character in the prompt and skips the skill."""
+        import zipfile
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        name = "<person\x1b>"
+        zip_path = tmp_path / "tag.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(app, ["add", str(zip_path), "--allow-xml-tags"], input="1\n")
+
+        assert result.exit_code == 1, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        prompt_area = result.stdout.split("Where to add?", 1)[0]
+        assert "<person\\x1b>" in prompt_area
+        assert "invalid chars" in " ".join(result.stdout.split())
+        assert not (skills_env.skills_dir / name).exists()
+
+    def test_add_github_multi_path_interactive_prompt_shows_tag_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The multi-path prompt lists a normal tag name and installs it with a warning."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        prepared = tmp_path / "gh-tree"
+        tag_dir = prepared / "path-a" / "<person>"
+        tag_dir.mkdir(parents=True)
+        (tag_dir / "SKILL.md").write_text(
+            '---\nname: "<person>"\ndescription: "Use <person>"\n---\nbody',
+            encoding="utf-8",
+        )
+        _create_skill(prepared / "path-b", "plain-skill")
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "path-b", "--allow-xml-tags"],
+            input="1\n",
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Found 2 skill(s): <person>, plain-skill" in result.stdout
+        assert "Added '<person>'" in result.stdout
+        assert "Added 'plain-skill'" in result.stdout
+        assert "frontmatter.name: cannot contain XML tags" in result.stdout
+        assert (skills_env.skills_dir / "<person>" / "SKILL.md").exists()
+        assert (skills_env.skills_dir / "plain-skill" / "SKILL.md").exists()
+
+    def test_add_github_multi_path_interactive_prompt_escapes_control_char_name(
+        self, skills_env: SkillsEnv, tmp_path: Path, monkeypatch
+    ):
+        """The multi-path prompt escapes a control character and skips the rejected skill."""
+        from types import SimpleNamespace
+
+        from skillport.interfaces.cli.commands import add as add_cli_module
+
+        name = "<person\x1b>"
+        prepared = tmp_path / "gh-tree"
+        tag_dir = prepared / "path-a" / name
+        tag_dir.mkdir(parents=True)
+        (tag_dir / "SKILL.md").write_text(
+            f"---\nname: {json.dumps(name)}\ndescription: Plain text\n---\nbody",
+            encoding="utf-8",
+        )
+        _create_skill(prepared / "path-b", "plain-skill")
+        monkeypatch.setattr(
+            add_cli_module,
+            "fetch_github_source_with_info",
+            lambda url, allow_symlinks=False: SimpleNamespace(
+                extracted_path=prepared, commit_sha="abc1234"
+            ),
+        )
+        monkeypatch.setattr(
+            add_cli_module, "get_default_branch", lambda owner, repo, auth=None: "main"
+        )
+        monkeypatch.setattr(add_cli_module, "is_interactive", lambda: True)
+
+        result = runner.invoke(
+            app,
+            ["add", "user/repo", "path-a", "path-b", "--allow-xml-tags"],
+            input="1\n",
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "\x1b" not in result.stdout
+        assert "\\x1b" in result.stdout
+        prompt_area = result.stdout.split("Where to add?", 1)[0]
+        assert "<person\\x1b>, plain-skill" in prompt_area
+        assert (skills_env.skills_dir / "plain-skill" / "SKILL.md").exists()
+        assert not (skills_env.skills_dir / name).exists()
+
+
 class TestFrontmatterKeyFatalCli:
     """Unregistered top-level keys stay fatal for validate (order.md §4 Rule 1)."""
 

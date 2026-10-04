@@ -181,12 +181,18 @@ skillport add <source> [options]
 | `--namespace`, `-n` | Custom namespace | source directory name |
 | `--name` | Override skill name (single skill only) | from SKILL.md |
 | `--allow-symlinks` | Allow compliant relative symlinks in the source (dangerous operation; only links that stay inside the individual skill are kept) | `false` |
+| `--allow-xml-tags` | Demote XML tags in frontmatter `name`/`description` from fatal to warning (dangerous operation; other validation rules stay fatal) | `false` |
 | `--json` | Output as JSON (for scripting/AI agents) | `false` |
 
 > **`--allow-symlinks` is not persisted.** The flag applies to the current command
 > invocation only. It is never written to the config file or to origin metadata,
 > so every `add`/`update` re-decides and a flagless `update` rejects symlinked
 > sources again.
+
+> **`--allow-xml-tags` is not persisted.** The flag applies to the current `add`
+> invocation only. It is never written to the config file or to origin metadata,
+> so the next flagless `add` and `skillport validate` treat XML tags in
+> `name`/`description` as fatal again.
 
 #### Interactive Mode
 

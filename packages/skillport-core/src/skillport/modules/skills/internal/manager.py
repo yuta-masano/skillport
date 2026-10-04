@@ -830,8 +830,13 @@ def copy_skill_dir(source: Path, dest: Path, *, allow_symlinks: bool = False) ->
         shutil.rmtree(snapshot.parent, ignore_errors=True)
 
 
-def _validate_skill_file(skill_dir: Path) -> list[ValidationIssue]:
+def _validate_skill_file(skill_dir: Path, *, allow_xml_tags: bool = False) -> list[ValidationIssue]:
     """Validate SKILL.md and return its non-fatal warnings.
+
+    Args:
+        skill_dir: Directory containing the SKILL.md to validate.
+        allow_xml_tags: If True, XML tag violations in name/description are
+            demoted to warnings instead of blocking the add.
 
     Raises:
         ValueError: If a fatal validation issue is found.
@@ -871,6 +876,7 @@ def _validate_skill_file(skill_dir: Path) -> list[ValidationIssue]:
         },
         strict=True,
         meta=meta,
+        allow_xml_tags=allow_xml_tags,
     )
     # strict=True keeps fatal and warning issues; only fatal blocks the add
     fatal = [i for i in issues if i.severity == "fatal"]
@@ -923,6 +929,7 @@ def add_local(
     namespace_override: str | None = None,
     rename_single_to: str | None = None,
     allow_symlinks: bool = False,
+    allow_xml_tags: bool = False,
 ) -> list[AddResultItem]:
     target_root = config.skills_dir
     target_root.mkdir(parents=True, exist_ok=True)
@@ -953,7 +960,7 @@ def add_local(
         warnings: list[ValidationIssue] = []
         try:
             snapshot = snapshot_skill_dir(skill.source_path, allow_symlinks=allow_symlinks)
-            warnings = _validate_skill_file(snapshot)
+            warnings = _validate_skill_file(snapshot, allow_xml_tags=allow_xml_tags)
 
             if skill_id in seen_ids:
                 raise ValueError(f"Duplicate skill id detected: {skill_id}")

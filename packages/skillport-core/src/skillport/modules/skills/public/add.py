@@ -59,6 +59,7 @@ class AddContext:
     namespace: str | None
     name: str | None
     allow_symlinks: bool = False
+    allow_xml_tags: bool = False
     # Accumulated results
     details: list[AddResultItem] = field(default_factory=list)
     added_ids: list[str] = field(default_factory=list)
@@ -294,6 +295,7 @@ def _process_directory_skills(
         namespace_override=namespace_override,
         rename_single_to=ctx.name,
         allow_symlinks=ctx.allow_symlinks,
+        allow_xml_tags=ctx.allow_xml_tags,
     )
 
     ctx.details = [
@@ -347,6 +349,7 @@ def _process_nested_zips(ctx: AddContext) -> None:
                 namespace=ctx.namespace,
                 keep_structure=ctx.namespace is not None,
                 allow_symlinks=ctx.allow_symlinks,
+                allow_xml_tags=ctx.allow_xml_tags,
             )
         except SymlinkPathError as exc:
             candidate_id = zip_file.name
@@ -509,6 +512,7 @@ def add_skill(
     pre_fetched_dir: Path | None = None,
     pre_fetched_commit_sha: str = "",
     allow_symlinks: bool = False,
+    allow_xml_tags: bool = False,
     cleanup_pre_fetched_dir: bool = True,
 ) -> AddResult:
     """Add a skill from builtin/local/github source."""
@@ -603,6 +607,7 @@ def add_skill(
             namespace=namespace,
             name=name,
             allow_symlinks=allow_symlinks,
+            allow_xml_tags=allow_xml_tags,
         )
 
         # 10. Process directory skills

@@ -250,6 +250,116 @@ class TestValidationFatal:
         assert len(xml_issues) == 0
 
 
+class TestAllowXmlTagsValidation:
+    """allow_xml_tags=True demotes XML tag violations to warnings."""
+
+    def test_name_xml_tags_become_warning(self):
+        """name XML tag violation is a warning only; tag characters are not invalid chars."""
+        issues = validate_skill_record(
+            {"name": "<person>", "description": "desc", "path": "/skills/<person>"},
+            allow_xml_tags=True,
+        )
+        assert [i for i in issues if i.severity == "fatal"] == []
+        xml_issues = [i for i in issues if "xml" in i.message.lower()]
+        assert len(xml_issues) == 1
+        assert xml_issues[0].severity == "warning"
+        assert xml_issues[0].field == "name"
+        assert xml_issues[0].message == "frontmatter.name: cannot contain XML tags"
+
+    def test_name_xml_warning_keeps_invalid_char_fatal(self):
+        """allow_xml_tags=True keeps the invalid-character fatal for chars outside tags."""
+        issues = validate_skill_record(
+            {
+                "name": "my_name<person>",
+                "description": "desc",
+                "path": "/skills/my_name<person>",
+            },
+            allow_xml_tags=True,
+        )
+        xml_issues = [i for i in issues if "xml" in i.message.lower()]
+        assert len(xml_issues) == 1
+        assert xml_issues[0].severity == "warning"
+        fatal = [i for i in issues if i.severity == "fatal"]
+        assert len(fatal) == 1
+        assert "invalid chars" in fatal[0].message
+
+    def test_name_xml_tag_trailing_hyphen_stays_fatal(self):
+        """allow_xml_tags=True keeps the trailing-hyphen fatal inside a tag name."""
+        issues = validate_skill_record(
+            {"name": "<person->", "description": "desc", "path": "/skills/<person->"},
+            allow_xml_tags=True,
+        )
+        fatal = [i for i in issues if i.severity == "fatal" and i.field == "name"]
+        assert len(fatal) == 1
+        assert "start or end" in fatal[0].message
+        xml_issues = [i for i in issues if "xml" in i.message.lower()]
+        assert len(xml_issues) == 1
+        assert xml_issues[0].severity == "warning"
+
+    @pytest.mark.parametrize(
+        "name",
+        ['<person key="x">', '<person key="\x1b">', '<person key="\x07">'],
+        ids=["attribute", "esc", "bel"],
+    )
+    def test_name_tag_internal_invalid_chars_stay_fatal(self, name: str):
+        """allow_xml_tags=True keeps tag-internal spaces, symbols, and control codes fatal."""
+        issues = validate_skill_record(
+            {"name": name, "description": "desc", "path": f"/skills/{name}"},
+            allow_xml_tags=True,
+        )
+        fatal = [i for i in issues if i.severity == "fatal" and i.field == "name"]
+        assert len(fatal) == 1
+        assert "invalid chars" in fatal[0].message
+        xml_issues = [i for i in issues if "xml" in i.message.lower()]
+        assert len(xml_issues) == 1
+        assert xml_issues[0].severity == "warning"
+
+    def test_description_xml_tags_become_warning(self):
+        """description XML tag violation is a warning and keeps message/field."""
+        issues = validate_skill_record(
+            {
+                "name": "my-skill",
+                "description": "Use when the user says <person>",
+                "path": "/skills/my-skill",
+            },
+            allow_xml_tags=True,
+        )
+        xml_issues = [i for i in issues if "xml" in i.message.lower()]
+        assert len(xml_issues) == 1
+        assert xml_issues[0].severity == "warning"
+        assert xml_issues[0].field == "description"
+        assert xml_issues[0].message == "frontmatter.description: cannot contain XML tags"
+
+    def test_description_xml_warning_keeps_other_fatal(self):
+        """allow_xml_tags=True does not demote non-XML fatal rules."""
+        issues = validate_skill_record(
+            {
+                "name": "wrong-name",
+                "description": "Use <person>",
+                "path": "/skills/my-skill",
+            },
+            allow_xml_tags=True,
+        )
+        xml_issues = [i for i in issues if "xml" in i.message.lower()]
+        assert len(xml_issues) == 1
+        assert xml_issues[0].severity == "warning"
+        fatal = [i for i in issues if i.severity == "fatal"]
+        assert len(fatal) == 1
+        assert "doesn't match directory" in fatal[0].message
+
+    def test_valid_description_has_no_xml_warning_with_flag(self):
+        """allow_xml_tags=True leaves a description without tags warning-free."""
+        issues = validate_skill_record(
+            {
+                "name": "my-skill",
+                "description": "Plain text description",
+                "path": "/skills/my-skill",
+            },
+            allow_xml_tags=True,
+        )
+        assert issues == []
+
+
 class TestValidationWarning:
     """Warning validation rules (exit code 0)."""
 

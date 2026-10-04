@@ -1,9 +1,11 @@
 """Add skills command."""
 
+import re
 import shutil
 from pathlib import Path, PurePosixPath
 
 import typer
+from rich.markup import escape as escape_markup
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 
@@ -152,26 +154,27 @@ def _prompt_namespace_selection(
             return True, namespace or _get_default_namespace(source)
 
     # Interactive mode
+    display_names = [_format_for_display(skill_name) for skill_name in skill_names]
     skill_display = (
-        skill_names[0]
+        display_names[0]
         if is_single
-        else ", ".join(skill_names[:3]) + ("..." if len(skill_names) > 3 else "")
+        else ", ".join(display_names[:3]) + ("..." if len(display_names) > 3 else "")
     )
 
     console.print(f"\n[bold]Found {len(skill_names)} skill(s):[/bold] {skill_display}")
     console.print("[bold]Where to add?[/bold]")
     if is_single:
-        console.print(f"  [info][1][/info] Flat       → skills/{skill_names[0]}/")
+        console.print(f"  [info][1][/info] Flat       → skills/{display_names[0]}/")
         console.print(
-            f"  [info][2][/info] Namespace  → skills/[dim]<ns>[/dim]/{skill_names[0]}/ "
+            f"  [info][2][/info] Namespace  → skills/[dim]<ns>[/dim]/{display_names[0]}/ "
             "[warning](Claude Code incompatible)[/warning]"
         )
     else:
         console.print(
-            f"  [info][1][/info] Flat       → skills/{skill_names[0]}/, skills/{skill_names[1]}/, ..."
+            f"  [info][1][/info] Flat       → skills/{display_names[0]}/, skills/{display_names[1]}/, ..."
         )
         console.print(
-            f"  [info][2][/info] Namespace  → skills/[dim]<ns>[/dim]/{skill_names[0]}/, ... "
+            f"  [info][2][/info] Namespace  → skills/[dim]<ns>[/dim]/{display_names[0]}/, ... "
             "[warning](Claude Code incompatible)[/warning]"
         )
     console.print("  [info][3][/info] Skip")
@@ -186,6 +189,22 @@ def _prompt_namespace_selection(
         return True, ns
 
     return keep_structure, namespace
+
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _format_for_display(value: str) -> str:
+    """Return a terminal-safe string for human-facing add output.
+
+    Input-derived values (skill names, skill IDs, and failure messages) can
+    contain control characters or Rich markup syntax. Control characters are
+    replaced with visible ``\\xNN`` escapes and square-bracket markup is
+    escaped, so the value is printed literally instead of moving the cursor or
+    styling text.
+    """
+    visible = _CONTROL_CHARACTERS.sub(lambda match: f"\\x{ord(match.group()):02x}", value)
+    return escape_markup(visible)
 
 
 def _display_add_result(result: "AddResult", json_output: bool) -> int:  # noqa: F821
@@ -206,7 +225,7 @@ def _display_add_result(result: "AddResult", json_output: bool) -> int:  # noqa:
     details = getattr(result, "details", [])
     if result.added:
         for skill_id in result.added:
-            console.print(f"[success]  ✓ Added '{skill_id}'[/success]")
+            console.print(f"[success]  ✓ Added '{_format_for_display(skill_id)}'[/success]")
         # Warnings belong to successful details, not to the added ID list:
         # the same ID can succeed more than once (e.g. --force), and each
         # success carries its own warnings.
@@ -214,7 +233,10 @@ def _display_add_result(result: "AddResult", json_output: bool) -> int:  # noqa:
             if not detail.success:
                 continue
             for warning in detail.warnings:
-                console.print(f"[warning]  ⚠ {detail.skill_id}: {warning.message}[/warning]")
+                console.print(
+                    f"[warning]  ⚠ {_format_for_display(detail.skill_id)}: "
+                    f"{_format_for_display(warning.message)}[/warning]"
+                )
     if result.skipped:
         for skill_id in result.skipped:
             detail_reason = next(
@@ -226,7 +248,10 @@ def _display_add_result(result: "AddResult", json_output: bool) -> int:  # noqa:
                 None,
             )
             skip_reason = detail_reason or result.message or "skipped"
-            console.print(f"[warning]  ⊘ Skipped '{skill_id}' ({skip_reason})[/warning]")
+            console.print(
+                f"[warning]  ⊘ Skipped '{_format_for_display(skill_id)}' "
+                f"({_format_for_display(skip_reason)})[/warning]"
+            )
 
     # Summary
     if result.added and not result.skipped:
@@ -234,14 +259,17 @@ def _display_add_result(result: "AddResult", json_output: bool) -> int:  # noqa:
         return 0
     elif result.added and result.skipped:
         print_warning(
-            f"Added {len(result.added)}, skipped {len(result.skipped)} ({result.message})"
+            f"Added {len(result.added)}, skipped {len(result.skipped)} "
+            f"({_format_for_display(result.message)})"
         )
         return 0
     elif result.skipped:
-        print_error(result.message or f"All {len(result.skipped)} skill(s) skipped")
+        print_error(
+            _format_for_display(result.message or f"All {len(result.skipped)} skill(s) skipped")
+        )
         return 1
     else:
-        print_error(result.message)
+        print_error(_format_for_display(result.message))
         return 1
 
 
@@ -255,6 +283,7 @@ def _add_from_github_paths(
     keep_structure: bool | None,
     namespace: str | None,
     allow_symlinks: bool = False,
+    allow_xml_tags: bool = False,
 ) -> "AddResult":  # noqa: F821
     """Add skills from GitHub shorthand with multiple paths.
 
@@ -344,6 +373,7 @@ def _add_from_github_paths(
                 pre_fetched_dir=path_dir,
                 pre_fetched_commit_sha=commit_sha,
                 allow_symlinks=allow_symlinks,
+                allow_xml_tags=allow_xml_tags,
                 cleanup_pre_fetched_dir=False,
             )
             all_added.extend(result.added)
@@ -472,6 +502,14 @@ def add(
         "--allow-symlinks",
         help="Allow compliant relative symlinks in the source (dangerous; not persisted)",
     ),
+    allow_xml_tags: bool = typer.Option(
+        False,
+        "--allow-xml-tags",
+        help=(
+            "Demote XML tags in frontmatter name/description from fatal to warning "
+            "(dangerous; not persisted)"
+        ),
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -503,6 +541,7 @@ def add(
                 keep_structure=keep_structure,
                 namespace=namespace,
                 allow_symlinks=allow_symlinks,
+                allow_xml_tags=allow_xml_tags,
             )
         else:
             # Route 2: Standard flow (URL, local, builtin, shorthand without paths)
@@ -528,6 +567,7 @@ def add(
                 pre_fetched_dir=temp_dir,
                 pre_fetched_commit_sha=commit_sha,
                 allow_symlinks=allow_symlinks,
+                allow_xml_tags=allow_xml_tags,
             )
 
         # Shared: Display result

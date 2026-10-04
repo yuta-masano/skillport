@@ -52,6 +52,16 @@ def _contains_xml_tags(text: str) -> bool:
     return bool(_XML_TAG_PATTERN.search(text))
 
 
+def _strip_xml_tag_delimiters(text: str) -> str:
+    """Remove only the delimiters of XML-like tags before the name charset rule.
+
+    The tag name and attributes stay in the text so that characters the XML tag
+    pattern would otherwise hide (spaces, quotes, control codes) are still
+    rejected by the name charset rule.
+    """
+    return _XML_TAG_PATTERN.sub(lambda match: match.group(0)[1:-1].lstrip("/"), text)
+
+
 # Allowed top-level frontmatter properties
 # Standard keys are validated by value; vendor keys are accepted as known
 # product extensions and only reported as a warning.
@@ -141,6 +151,7 @@ def validate_skill_record(
     *,
     strict: bool = False,
     meta: dict | None = None,
+    allow_xml_tags: bool = False,
 ) -> list[ValidationIssue]:
     """Validate a skill dict; returns issue list.
 
@@ -151,6 +162,8 @@ def validate_skill_record(
                 non-fatal warnings along with the validation result.
         meta: Raw frontmatter dict from parse_frontmatter(). If provided,
               enables key existence checks (A1/A2). Used by add command.
+        allow_xml_tags: If True, XML tag violations in name/description are
+                demoted to warnings. All other fatal rules stay fatal.
 
     Returns:
         List of validation issues.
@@ -245,7 +258,8 @@ def validate_skill_record(
                     field="name",
                 )
             )
-        if not _validate_name_chars(name):
+        name_for_charset = _strip_xml_tag_delimiters(name) if allow_xml_tags else name
+        if not _validate_name_chars(name_for_charset):
             issues.append(
                 ValidationIssue(
                     severity="fatal",
@@ -253,7 +267,7 @@ def validate_skill_record(
                     field="name",
                 )
             )
-        if name.startswith("-") or name.endswith("-"):
+        if name_for_charset.startswith("-") or name_for_charset.endswith("-"):
             issues.append(
                 ValidationIssue(
                     severity="fatal",
@@ -281,7 +295,7 @@ def validate_skill_record(
         if _contains_xml_tags(name):
             issues.append(
                 ValidationIssue(
-                    severity="fatal",
+                    severity="warning" if allow_xml_tags else "fatal",
                     message="frontmatter.name: cannot contain XML tags",
                     field="name",
                 )
@@ -299,7 +313,7 @@ def validate_skill_record(
         if _contains_xml_tags(description):
             issues.append(
                 ValidationIssue(
-                    severity="fatal",
+                    severity="warning" if allow_xml_tags else "fatal",
                     message="frontmatter.description: cannot contain XML tags",
                     field="description",
                 )
